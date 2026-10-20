@@ -2,8 +2,8 @@ openapi: 3.1.0
 info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
-  version: 0.1.0
-  description: API specification
+  version: 0.3.0
+  description: Public social media media extraction and download API
 servers:
   - url: /api
     description: Base API path
@@ -11,14 +11,13 @@ tags:
   - name: health
     description: Health operations
   - name: downloads
-    description: Public social media media extraction
+    description: Public social media extraction and downloads
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -26,12 +25,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
-  /download:
+  /extract:
     post:
-      operationId: downloadMedia
+      operationId: extractMedia
       tags: [downloads]
-      summary: Extract downloadable media from an authorized public post
-      description: Returns media metadata and source URLs for public TikTok, Instagram, or Pinterest posts that the requester is authorized to save. Private accounts and watermark removal are not supported.
+      summary: Extract metadata and available media from a public post or profile
+      description: Only publicly accessible posts that the requester is authorized to save are supported. Private content and watermark removal are not supported.
       requestBody:
         required: true
         content:
@@ -40,7 +39,7 @@ paths:
               $ref: "#/components/schemas/DownloadInput"
       responses:
         "200":
-          description: Media extracted successfully
+          description: Extracted public media metadata
           content:
             application/json:
               schema:
@@ -58,13 +57,99 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApiError"
         "429":
-          description: The source platform is rate-limiting requests
+          description: Request rate limit reached
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiError"
         "502":
-          description: The source platform could not be reached
+          description: Source platform could not be reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /highlight:
+    post:
+      operationId: downloadHighlight
+      tags: [downloads]
+      summary: Extract publicly accessible Instagram story or highlight items
+      description: Returns a bounded list of publicly accessible story items. Private, expired, or login-gated stories are not supported.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HighlightInput"
+      responses:
+        "200":
+          description: Highlight or story items
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HighlightResult"
+        "400":
+          description: Invalid or unsupported Instagram link
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "422":
+          description: Stories are private, expired, or not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "429":
+          description: Request rate limit reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "502":
+          description: Source platform could not be reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+  /download:
+    post:
+      operationId: downloadFile
+      tags: [downloads]
+      summary: Download or convert one extracted media item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DownloadFileInput"
+      responses:
+        "200":
+          description: Downloaded media file
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Extraction expired or media item was not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "422":
+          description: Requested conversion is not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "429":
+          description: Request rate limit reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "502":
+          description: Media source could not be reached or converted
           content:
             application/json:
               schema:
@@ -76,33 +161,97 @@ components:
       properties:
         status:
           type: string
-      required:
-        - status
+      required: [status]
     DownloadInput:
       type: object
       additionalProperties: false
       properties:
         url:
           type: string
-          format: uri
+          minLength: 1
+          maxLength: 2048
+        mode:
+          type: string
+          enum: [post, profile]
+          default: post
+        platform:
+          type: ["string", "null"]
+          enum: [instagram, tiktok, pinterest, null]
+      required: [url]
+    HighlightInput:
+      type: object
+      additionalProperties: false
+      properties:
+        url:
+          type: string
           minLength: 1
           maxLength: 2048
       required: [url]
+    DownloadFileInput:
+      type: object
+      additionalProperties: false
+      properties:
+        downloadId:
+          type: string
+          minLength: 32
+          maxLength: 32
+        assetType:
+          type: string
+          enum: [media, avatar, audio]
+        mediaIndex:
+          type: ["integer", "null"]
+          minimum: 0
+        format:
+          type: string
+          enum: [original, webp, mp3]
+          default: original
+        bitrate:
+          type: integer
+          enum: [128, 320]
+          default: 320
+      required: [downloadId, assetType, mediaIndex, format, bitrate]
+    DownloadCreator:
+      type: object
+      properties:
+        handle:
+          type: ["string", "null"]
+        name:
+          type: ["string", "null"]
+        avatarUrl:
+          type: ["string", "null"]
+          format: uri
+        profileUrl:
+          type: ["string", "null"]
+          format: uri
+        verified:
+          type: boolean
+      required: [handle, name, avatarUrl, profileUrl, verified]
     DownloadMedia:
       type: object
       properties:
         url:
           type: string
           format: uri
+        type:
+          type: string
+          enum: [video, image, profile]
         quality:
           type: string
         format:
           type: string
-          enum: [mp4, jpg, png, webp, unknown]
-      required: [url, quality, format]
+          enum: [mp4, jpg, jpeg, png, webp, unknown]
+        width:
+          type: ["integer", "null"]
+        height:
+          type: ["integer", "null"]
+        hasAudio:
+          type: boolean
+      required: [url, type, quality, format, width, height, hasAudio]
     DownloadResult:
       type: object
       properties:
+        downloadId:
+          type: string
         status:
           type: string
           enum: [success]
@@ -111,21 +260,87 @@ components:
           enum: [instagram, tiktok, pinterest]
         type:
           type: string
-          enum: [video, image, carousel]
+          enum: [video, image, carousel, profile]
         title:
           type: string
+        caption:
+          type: string
+        description:
+          type: string
+        uploadDate:
+          type: ["string", "null"]
+        boardName:
+          type: ["string", "null"]
+        hashtags:
+          type: array
+          items:
+            type: string
         thumbnail:
           type: ["string", "null"]
           format: uri
+        creator:
+          $ref: "#/components/schemas/DownloadCreator"
         media:
           type: array
           items:
             $ref: "#/components/schemas/DownloadMedia"
-      required: [status, platform, type, title, thumbnail, media]
+        audioAvailable:
+          type: boolean
+      required:
+        - downloadId
+        - status
+        - platform
+        - type
+        - title
+        - caption
+        - description
+        - uploadDate
+        - boardName
+        - hashtags
+        - thumbnail
+        - creator
+        - media
+        - audioAvailable
+    HighlightStory:
+      type: object
+      properties:
+        storyNumber:
+          type: integer
+        mediaIndex:
+          type: integer
+        type:
+          type: string
+          enum: [photo, video]
+        duration:
+          type: ["number", "null"]
+        thumbnail:
+          type: ["string", "null"]
+          format: uri
+        createdAt:
+          type: ["string", "null"]
+      required: [storyNumber, mediaIndex, type, duration, thumbnail, createdAt]
+    HighlightResult:
+      type: object
+      properties:
+        downloadId:
+          type: string
+        title:
+          type: string
+        cover:
+          type: ["string", "null"]
+          format: uri
+        creator:
+          $ref: "#/components/schemas/DownloadCreator"
+        stories:
+          type: array
+          items:
+            $ref: "#/components/schemas/HighlightStory"
+        truncated:
+          type: boolean
+      required: [downloadId, title, cover, creator, stories, truncated]
     ApiError:
       type: object
       properties:
         error:
           type: string
       required: [error]
-
