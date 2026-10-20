@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: downloads
+    description: Public social media media extraction
 paths:
   /healthz:
     get:
@@ -24,6 +26,49 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /download:
+    post:
+      operationId: downloadMedia
+      tags: [downloads]
+      summary: Extract downloadable media from an authorized public post
+      description: Returns media metadata and source URLs for public TikTok, Instagram, or Pinterest posts that the requester is authorized to save. Private accounts and watermark removal are not supported.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DownloadInput"
+      responses:
+        "200":
+          description: Media extracted successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DownloadResult"
+        "400":
+          description: Invalid or unsupported URL
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "422":
+          description: Media unavailable, private, or unsupported for extraction
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "429":
+          description: The source platform is rate-limiting requests
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "502":
+          description: The source platform could not be reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
 components:
   schemas:
     HealthStatus:
@@ -33,4 +78,54 @@ components:
           type: string
       required:
         - status
+    DownloadInput:
+      type: object
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          format: uri
+          minLength: 1
+          maxLength: 2048
+      required: [url]
+    DownloadMedia:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+        quality:
+          type: string
+        format:
+          type: string
+          enum: [mp4, jpg, png, webp, unknown]
+      required: [url, quality, format]
+    DownloadResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [success]
+        platform:
+          type: string
+          enum: [instagram, tiktok, pinterest]
+        type:
+          type: string
+          enum: [video, image, carousel]
+        title:
+          type: string
+        thumbnail:
+          type: ["string", "null"]
+          format: uri
+        media:
+          type: array
+          items:
+            $ref: "#/components/schemas/DownloadMedia"
+      required: [status, platform, type, title, thumbnail, media]
+    ApiError:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
 

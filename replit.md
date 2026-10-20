@@ -1,44 +1,46 @@
-# [Project name]
+# Social Media Downloader
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Ad-free downloads for public TikTok, Instagram, and Pinterest media that users are authorized to save.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `uv run python -m uvicorn main:app --app-dir artifacts/api-server --host 0.0.0.0 --port 8080 --reload` — run the FastAPI service
+- `pnpm --filter @workspace/social-media-downloader run dev` — run the web app
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Required media tools: Python 3.11, yt-dlp, gallery-dl, and ffmpeg
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- API: FastAPI on Python 3.11
+- Validation: Pydantic on the API; OpenAPI/Orval-generated TypeScript clients
+- Web: React + Vite
+- API runtime: Uvicorn
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `artifacts/social-media-downloader/` — React + Vite downloader UI
+- `artifacts/api-server/main.py` — FastAPI media extraction API
+- `lib/api-spec/openapi.yaml` — API contract source of truth
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- The downloader processes public links only and does not use account cookies, bypass private-account controls, or remove watermarks.
+- Video formats are returned only when a direct MP4 source is available; gallery-dl is used for image posts and carousels.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Paste a supported public social-media link to retrieve a preview and direct media download links. No account or ad network is used.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+Keep the product ad-free and avoid popup ads, fake controls, and intermediary redirect sites.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Source URLs are provided by the platforms and may expire; rerun extraction if a link stops working.
 
 ## Pointers
 
