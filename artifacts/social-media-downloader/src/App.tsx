@@ -36,7 +36,7 @@ type HighlightResult = {
   truncated: boolean;
 };
 type HighlightVariables = { data: { url: string } };
-type FileVariables = { data: { downloadId: string; assetType: 'media' | 'avatar' | 'audio'; mediaIndex: number | null; format: 'original' | 'webp' | 'mp3'; bitrate: 128 | 320 } };
+type FileVariables = { data: { downloadId: string; assetType: 'media' | 'avatar' | 'audio' | 'archive'; mediaIndex: number | null; format: 'original' | 'webp' | 'mp3'; bitrate: 128 | 320 } };
 type CurrentApiHooks = {
   useExtractMedia: () => UseMutationResult<DownloadResult, unknown, ExtractVariables>;
   useDownloadHighlight: () => UseMutationResult<HighlightResult, unknown, HighlightVariables>;
@@ -77,6 +77,13 @@ function resultTypeLabel(result: DownloadResult) {
   return result.type === 'video' ? 'Video' : 'Image';
 }
 
+function hashtagUrl(platform: Platform, tag: string) {
+  const value = encodeURIComponent(tag.replace(/^#/, ''));
+  if (platform === 'instagram') return `https://www.instagram.com/explore/tags/${value}/`;
+  if (platform === 'tiktok') return `https://www.tiktok.com/tag/${value}`;
+  return `https://www.pinterest.com/search/pins/?q=${value}`;
+}
+
 function Avatar({ creator }: { creator: DownloadResult['creator'] }) {
   const initials = (creator.name || creator.handle || '?').replace(/^@/, '').slice(0, 1).toUpperCase();
   return (
@@ -106,7 +113,7 @@ function Metadata({ result, onCopy, copied }: { result: DownloadResult; onCopy: 
           {copied === 'hashtags' ? 'Copied' : 'Copy'}
         </button>
       </div>
-      {tags.length ? <div className="tags">{tags.map((tag, index) => <span className="tag" key={`${tag}-${index}`}>{tag.startsWith('#') ? tag : `#${tag}`}</span>)}</div> : <p className="metadata-empty">No hashtags were returned.</p>}
+      {tags.length ? <div className="tags">{tags.map((tag, index) => <a className="tag" key={`${tag}-${index}`} href={hashtagUrl(result.platform, tag)} target="_blank" rel="noreferrer">{tag.startsWith('#') ? tag : `#${tag}`}</a>)}</div> : <p className="metadata-empty">No hashtags were returned.</p>}
     </div>
   );
 }
@@ -131,7 +138,8 @@ function Downloader() {
   const isStoryUrl = useMemo(() => {
     try {
       const parsed = new URL(url.trim());
-      return parsed.hostname.toLowerCase().includes('instagram.com') && /\/stories\//i.test(parsed.pathname);
+      const host = parsed.hostname.toLowerCase();
+      return (host === 'instagram.com' || host.endsWith('.instagram.com') || host === 'instagr.am' || host.endsWith('.instagr.am')) && /\/stories\//i.test(parsed.pathname);
     } catch { return false; }
   }, [url]);
   const loading = extractMutation.isPending || highlightMutation.isPending;
@@ -141,18 +149,15 @@ function Downloader() {
   const activeMedia = mediaItems[activeIndex];
   const isImage = activeMedia?.type === 'image' || activeMedia?.type === 'profile';
   const previewUrl = isImage ? activeMedia?.url : result?.thumbnail;
-  const audioIndex = mediaItems.findIndex((item) => item.type === 'video' && item.hasAudio);
-  const audioAvailable = Boolean(result?.audioAvailable && audioIndex >= 0);
+  const audioAvailable = Boolean(result?.audioAvailable);
   const serviceUnavailable = healthQuery.isError || (healthQuery.data !== undefined && healthQuery.data.status !== 'ok');
   const extractionError = extractMutation.isError ? errorText(extractMutation.error) : highlightMutation.isError ? errorText(highlightMutation.error) : '';
 
   const qualityOptions = useMemo(() => {
     if (!result) return [];
-    const allowed = ['4k', '1440', '1080', '720', '480'];
-    const found = result.media
+    return result.media
       .map((item, index) => ({ item, index }))
-      .filter(({ item }) => item.type === 'video' && allowed.some((quality) => item.quality.toLowerCase().includes(quality)));
-    return found;
+      .filter(({ item }) => item.type === 'video');
   }, [result]);
 
   const setLocalStatus = (key: string, status: 'loading' | 'done' | 'error', message = '') => {
@@ -279,12 +284,10 @@ function Downloader() {
     if (!highlight) return;
     setLocalStatus('all-stories', 'loading');
     try {
-      for (const story of highlight.stories) {
-        const blob = await fileMutation.mutateAsync({
-          data: { downloadId: highlight.downloadId, assetType: 'media', mediaIndex: story.mediaIndex, format: 'original', bitrate: 320 },
-        });
-        saveBlob(blob, `${safeName(highlight.title)}-story-${story.storyNumber}.${story.type === 'video' ? 'mp4' : 'jpg'}`);
-      }
+      const blob = await fileMutation.mutateAsync({
+        data: { downloadId: highlight.downloadId, assetType: 'archive', mediaIndex: null, format: 'original', bitrate: 320 },
+      });
+      saveBlob(blob, `${safeName(highlight.title)}-stories.zip`);
       setLocalStatus('all-stories', 'done');
     } catch (error) {
       setLocalStatus('all-stories', 'error', errorText(error));
@@ -313,7 +316,7 @@ function Downloader() {
         <section className="intro">
           <div className="eyebrow">A simple place to keep a post</div>
           <h1 className="hero-title">Your saved posts,<br /><span>without the noise.</span></h1>
-          <p className="hero-copy">Bring a public Instagram, TikTok, or Pinterest link. We’ll show what’s available to save, with no account or detours.</p>
+          <p className="hero-copy">Bring a public Instagram, TikTok, or Pinterest link. We’ll show what the source makes available, without ads or unnecessary steps.</p>
         </section>
 
         <form className="composer" onSubmit={submit} data-testid="form-download">
@@ -397,9 +400,20 @@ function Downloader() {
               <div className="result-layout">
                 <div className="preview-column">
                   <div className="preview" data-testid="preview-media">
-                    {previewUrl ? <img src={previewUrl} alt={`Preview of ${result.title || 'the selected post'}`} data-testid="img-preview" /> : (
+                    {activeMedia?.type === 'video' ? (
+                      <video
+                        className="video-preview"
+                        src={activeMedia.url}
+                        poster={result.thumbnail || undefined}
+                        controls
+                        playsInline
+                        preload="metadata"
+                        aria-label={`Preview of ${result.title || 'the selected video'}`}
+                        data-testid="video-preview"
+                      />
+                    ) : previewUrl ? <img src={previewUrl} alt={`Preview of ${result.title || 'the selected post'}`} data-testid="img-preview" /> : (
                       <div className="preview-empty">
-                        {activeMedia?.type === 'video' ? <Video size={22} /> : activeMedia ? <ImageIcon size={22} /> : <CircleAlert size={22} />}
+                        {activeMedia ? <ImageIcon size={22} /> : <CircleAlert size={22} />}
                         <span>{activeMedia ? 'Preview unavailable' : 'No media files were returned for this link.'}</span>
                       </div>
                     )}

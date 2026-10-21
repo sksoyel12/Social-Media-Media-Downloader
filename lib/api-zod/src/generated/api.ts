@@ -53,7 +53,7 @@ export const ExtractMediaResponse = zod.object({
   "url": zod.string().url(),
   "type": zod.enum(['video', 'image', 'profile']),
   "quality": zod.string(),
-  "format": zod.enum(['mp4', 'jpg', 'jpeg', 'png', 'webp', 'unknown']),
+  "format": zod.enum(['mp4', 'm4v', 'mov', 'webm', 'jpg', 'jpeg', 'png', 'webp', 'gif', 'avif', 'unknown']),
   "width": zod.number().int().nullable(),
   "height": zod.number().int().nullable(),
   "hasAudio": zod.boolean()
@@ -110,7 +110,7 @@ export const downloadFileBodyBitrateDefault = 320;
 
 export const DownloadFileBody = zod.object({
   "downloadId": zod.string().min(downloadFileBodyDownloadIdMin).max(downloadFileBodyDownloadIdMax),
-  "assetType": zod.enum(['media', 'avatar', 'audio']),
+  "assetType": zod.enum(['media', 'avatar', 'audio', 'archive']),
   "mediaIndex": zod.number().int().min(downloadFileBodyMediaIndexMin).nullable(),
   "format": zod.enum(['original', 'webp', 'mp3']).default(downloadFileBodyFormatDefault),
   "bitrate": zod.union([zod.literal(128),zod.literal(320)]).default(downloadFileBodyBitrateDefault)

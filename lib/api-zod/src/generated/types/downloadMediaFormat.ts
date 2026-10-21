@@ -11,9 +11,14 @@ export type DownloadMediaFormat = typeof DownloadMediaFormat[keyof typeof Downlo
 
 export const DownloadMediaFormat = {
   mp4: 'mp4',
+  m4v: 'm4v',
+  mov: 'mov',
+  webm: 'webm',
   jpg: 'jpg',
   jpeg: 'jpeg',
   png: 'png',
   webp: 'webp',
+  gif: 'gif',
+  avif: 'avif',
   unknown: 'unknown',
 } as const;

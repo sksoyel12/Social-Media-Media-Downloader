@@ -144,6 +144,8 @@ button { color: inherit; }
 .preview-column { min-width:0; padding:20px; border-right:1px solid rgba(255,255,255,.075); }
 .preview { position:relative; display:grid; place-items:center; width:100%; aspect-ratio:4/4.4; overflow:hidden; border:1px solid rgba(255,255,255,.08); border-radius:20px; background:rgba(0,0,0,.28); }
 .preview img { width:100%; height:100%; object-fit:contain; }
+.preview video { width:100%; height:100%; object-fit:contain; background:#000; }
+.preview:has(video) { aspect-ratio:16/10; }
 .preview-empty { display:flex; flex-direction:column; align-items:center; gap:9px; max-width:220px; padding:24px; color:#969ba3; text-align:center; font-size:12px; line-height:1.5; }
 .media-count { position:absolute; right:11px; bottom:11px; padding:6px 9px; border:1px solid rgba(255,255,255,.13); border-radius:99px; background:rgba(12,13,16,.68); color:#f1f2f4; font:10px var(--app-font-mono); backdrop-filter:blur(8px); }
 .preview-nav { display:flex; gap:6px; margin-top:10px; overflow:auto; }
@@ -172,7 +174,8 @@ button { color: inherit; }
 .caption-text.expanded { display:block; }
 .expand-copy { padding:6px 0 0; border:0; background:transparent; color:#a9dfc1; font-size:11px; cursor:pointer; }
 .tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
-.tag { color:#a9dfc1; font-size:11px; }
+.tag { color:#a9dfc1; font-size:11px; text-decoration:none; }
+.tag:hover { color:#d1f2df; text-decoration:underline; }
 .metadata-empty { margin-top:9px; color:#838891; font-size:11px; }
 .mobile-details { display:none; }
 .download-section { margin-top:20px; padding-top:17px; border-top:1px solid rgba(255,255,255,.075); }
@@ -233,6 +236,7 @@ button { color: inherit; }
   .result-layout { display:flex; flex-direction:column; }
   .preview-column { padding:14px; border:0; border-bottom:1px solid rgba(255,255,255,.07); }
   .preview { aspect-ratio:1/1; max-height:460px; }
+  .preview:has(video) { aspect-ratio:16/9; }
   .preview-nav { margin-top:8px; }
   .result-details { padding:16px; }
   .highlight-content { padding:15px; }

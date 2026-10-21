@@ -13,4 +13,5 @@ export const DownloadFileInputAssetType = {
   media: 'media',
   avatar: 'avatar',
   audio: 'audio',
+  archive: 'archive',
 } as const;

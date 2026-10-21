@@ -197,7 +197,7 @@ components:
           maxLength: 32
         assetType:
           type: string
-          enum: [media, avatar, audio]
+          enum: [media, avatar, audio, archive]
         mediaIndex:
           type: ["integer", "null"]
           minimum: 0
@@ -239,7 +239,7 @@ components:
           type: string
         format:
           type: string
-          enum: [mp4, jpg, jpeg, png, webp, unknown]
+          enum: [mp4, m4v, mov, webm, jpg, jpeg, png, webp, gif, avif, unknown]
         width:
           type: ["integer", "null"]
         height:
