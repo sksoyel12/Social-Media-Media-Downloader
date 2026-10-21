@@ -77,6 +77,15 @@ function resultTypeLabel(result: DownloadResult) {
   return result.type === 'video' ? 'Video' : 'Image';
 }
 
+function qualityLabel(media: DownloadResult['media'][number]) {
+  const height = media.height ?? Number.parseInt(media.quality, 10);
+  if (height >= 2160) return `4K · ${height}p`;
+  if (height >= 1440) return `QHD · ${height}p`;
+  if (height >= 1080) return `Full HD · ${height}p`;
+  if (height >= 720) return `HD · ${height}p`;
+  return media.quality || 'Available';
+}
+
 function hashtagUrl(platform: Platform, tag: string) {
   const value = encodeURIComponent(tag.replace(/^#/, ''));
   if (platform === 'instagram') return `https://www.instagram.com/explore/tags/${value}/`;
@@ -159,6 +168,8 @@ function Downloader() {
       .map((item, index) => ({ item, index }))
       .filter(({ item }) => item.type === 'video');
   }, [result]);
+  const currentQuality = qualityOptions.find(({ index }) => index === activeIndex)?.item ?? qualityOptions[0]?.item;
+  const isBestQuality = qualityOptions.length > 0 && activeIndex === qualityOptions[0].index;
 
   const setLocalStatus = (key: string, status: 'loading' | 'done' | 'error', message = '') => {
     setDownloadState((current) => ({ ...current, [key]: status }));
@@ -464,10 +475,28 @@ function Downloader() {
                       <>
                         <div className="selection-row">
                           {qualityOptions.length > 0 && !isImage && (
-                            <label className="selection-field">Quality
-                              <select aria-label="Video quality" value={qualityOptions.some(({ index }) => index === activeIndex) ? String(activeIndex) : String(qualityOptions[0].index)} onChange={(event) => setSelectedMedia(Number(event.target.value))} data-testid="select-quality">
-                                {qualityOptions.map(({ item, index }) => <option value={index} key={`${item.quality}-${index}`}>{item.quality}</option>)}
-                              </select>
+                            <label className="quality-picker">
+                              <span className="quality-picker-heading">
+                                <span>Video quality</span>
+                                <span className="quality-availability">{qualityOptions.length} available</span>
+                              </span>
+                              <span className="quality-select-shell">
+                                <span className="quality-glyph"><Video size={16} /></span>
+                                <span className="quality-current">
+                                  <span className="quality-current-value">{currentQuality ? qualityLabel(currentQuality) : 'Best available'}</span>
+                                  <span className="quality-current-note">Source resolution</span>
+                                </span>
+                                <span className={`quality-best ${isBestQuality ? 'is-best' : ''}`}>{isBestQuality ? 'BEST' : 'SELECTED'}</span>
+                                <ChevronDown className="quality-chevron" size={16} />
+                                <select
+                                  aria-label="Video quality"
+                                  value={qualityOptions.some(({ index }) => index === activeIndex) ? String(activeIndex) : String(qualityOptions[0].index)}
+                                  onChange={(event) => setSelectedMedia(Number(event.target.value))}
+                                  data-testid="select-quality"
+                                >
+                                  {qualityOptions.map(({ item, index }) => <option value={index} key={`${item.quality}-${index}`}>{qualityLabel(item)}</option>)}
+                                </select>
+                              </span>
                             </label>
                           )}
                           {isImage && (
