@@ -542,8 +542,8 @@ function Downloader() {
     const filename = `${safeName(result.title)}-${audioBitrate}kbps.mp3`;
 
     try {
-      const isYouTube = result.platform === 'youtube';
-      if (result.audioUrl && !isYouTube) {
+      const isPureMp3 = Boolean(result.audioUrl && (result.audioUrl.toLowerCase().includes('.mp3') || result.audioUrl.includes('mime=audio')));
+      if (isPureMp3 && result.audioUrl && result.platform !== 'youtube') {
         await triggerDirectBrowserDownload(result.audioUrl, filename);
         setLocalStatus(key, 'done');
         return;
@@ -737,8 +737,8 @@ function Downloader() {
           </div>
 
           <div className="form-row">
-            <div className="url-wrap">
-              <Link2 className="url-icon" size={17} aria-hidden="true" />
+            <div className="url-wrap border border-white/10 focus-within:border-white/30 rounded-2xl">
+              <Link2 className="url-icon shrink-0" size={17} aria-hidden="true" />
               <label className="sr-only" htmlFor="post-url">
                 {mode === 'profile'
                   ? 'Public profile URL or @handle'

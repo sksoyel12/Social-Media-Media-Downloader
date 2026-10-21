@@ -1,7 +1,5 @@
 import {
-  ArrowDownToLine,
   BadgeCheck,
-  Check,
   ChevronLeft,
   ChevronRight,
   Image as ImageIcon,
@@ -71,28 +69,6 @@ export function CarouselViewer({
             </div>
           )}
         </div>
-
-        <button
-          type="button"
-          onClick={() => onDownloadSlide(0)}
-          disabled={downloadStatus === 'loading'}
-          className="download-button mt-5 max-w-[260px]"
-          data-testid="button-download-hd-dp"
-        >
-          {downloadStatus === 'loading' ? (
-            <>
-              <span className="loader" /> Preparing HD photo
-            </>
-          ) : downloadStatus === 'done' ? (
-            <>
-              <Check size={15} /> HD Profile Photo Saved
-            </>
-          ) : (
-            <>
-              Download HD Profile Photo <ArrowDownToLine size={15} />
-            </>
-          )}
-        </button>
       </div>
     );
   }

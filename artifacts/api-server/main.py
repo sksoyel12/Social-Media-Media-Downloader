@@ -106,20 +106,75 @@ def is_generic_instagram_logo(url: Optional[str]) -> bool:
     return (
         "instagram_logo" in lower or
         "instagram-logo" in lower or
+        "instagramlogo" in lower or
+        "instagram_icon" in lower or
+        "instagram-icon" in lower or
+        "brand_assets" in lower or
+        "brand-assets" in lower or
+        "brandassets" in lower or
+        "brand" in lower or
         "4168x4168" in lower or
         "static.cdninstagram.com" in lower or
         "/rsrc.php/" in lower or
         "/static/images/" in lower or
-        "brand_assets" in lower or
+        "/static/rsrc/" in lower or
         "favicon" in lower or
-        "instagram_icon" in lower or
         "ig_icon" in lower or
         "apple-touch-icon" in lower or
-        "logo" in lower or
         "play-button" in lower or
         "transparent.png" in lower or
-        "spacer.gif" in lower
+        "spacer.gif" in lower or
+        "sprite" in lower or
+        "glyph" in lower or
+        "meta_logo" in lower or
+        "instagram-app" in lower or
+        "fbcdn.net/rsrc.php" in lower or
+        "150x150" in lower or
+        "100x100" in lower or
+        bool(re.search(r"logo.*\.(?:png|jpg|jpeg|svg|webp)", lower)) or
+        bool(re.search(r"instagram[_-]?(?:glyph|brand|icon|wordmark|logo)", lower))
     )
+
+
+def is_authentic_story_media(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    if is_generic_instagram_logo(url):
+        return False
+    lower = url.lower()
+    if "instagram_logo" in lower or "brand" in lower or "static.cdninstagram.com" in lower or "/rsrc.php/" in lower or "/static/" in lower:
+        return False
+    if "cdninstagram.com" not in lower and "fbcdn.net" not in lower and "instagram." not in lower:
+        return False
+    return (
+        ".mp4" in lower or
+        ".jpg" in lower or
+        ".jpeg" in lower or
+        "/v/t51." in lower or
+        "_nc_cat" in lower or
+        "_nc_sid" in lower or
+        "/o1/v/" in lower or
+        "video" in lower
+    )
+
+
+def id_to_shortcode(id_str: Optional[str]) -> str:
+    if not id_str:
+        return ""
+    try:
+        clean = re.sub(r"\D+", "", str(id_str).split("_")[0])
+        if not clean:
+            return ""
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        n = int(clean)
+        sc = ""
+        while n > 0:
+            rem = n % 64
+            sc = alphabet[rem] + sc
+            n //= 64
+        return sc
+    except Exception:
+        return ""
 
 
 def build_stream_url(raw_url: str, filename: Optional[str] = None, inline: bool = False) -> str:
@@ -729,29 +784,29 @@ def extract_tiktok(url: str, is_profile: bool, handle: Optional[str]) -> Dict[st
 
     if is_profile:
         target_handle = handle or (url.split("/@")[1].split("/")[0].split("?")[0] if "/@" in url else "tiktok")
+        # Strategy 1: TikTok embed page scraper (bypasses Cloudflare & datacenter IP blocks, extracts 1080p DP)
         try:
-            resp = requests.get(
-                f"https://www.tikwm.com/api/user/info?unique_id={target_handle}",
+            emb_resp = requests.get(
+                f"https://www.tiktok.com/embed/@{target_handle}",
                 headers={"User-Agent": DESKTOP_UA},
                 timeout=8,
             )
-            if resp.ok:
-                user = (resp.json().get("data") or {}).get("user") or {}
-                hd_av = user.get("avatarLarger") or user.get("avatarMedium") or user.get("avatarThumb")
-                if hd_av:
-                    creator["handle"] = user.get("uniqueId") or target_handle
-                    creator["name"] = user.get("nickname") or creator["handle"]
-                    creator["verified"] = bool(user.get("verified"))
-                    creator["profileUrl"] = f"https://www.tiktok.com/@{creator['handle']}"
-                    caption = user.get("signature") or ""
-                    title = f"{creator['name']} (@{creator['handle']})"
-                    proxied = build_stream_url(hd_av, f"{creator['handle']}-avatar.jpg", True)
+            if emb_resp.ok:
+                m = re.search(r'https://[^"\'\s]+(?:avt|avatar|tiktokcdn)[^"\'\s]+tplv-tiktokx-cropcenter:[^"\'\s]+', emb_resp.text, re.I)
+                if m:
+                    raw_av = m.group(0).replace("&amp;", "&")
+                    hd_av = re.sub(r'cropcenter:\d+:\d+', 'cropcenter:1080:1080', raw_av)
+                    creator["handle"] = target_handle
+                    creator["name"] = target_handle
+                    creator["profileUrl"] = f"https://www.tiktok.com/@{target_handle}"
+                    title = f"{target_handle} (@{target_handle})"
+                    proxied = build_stream_url(hd_av, f"{target_handle}-avatar.jpg", True)
                     creator["avatarUrl"] = proxied
                     thumbnail = proxied
                     media.append({
                         "url": proxied,
                         "rawUrl": hd_av,
-                        "downloadUrl": build_stream_url(hd_av, f"{creator['handle']}-profile-photo-hd.jpg", False),
+                        "downloadUrl": build_stream_url(hd_av, f"{target_handle}-profile-photo-hd.jpg", False),
                         "thumbnail": proxied,
                         "type": "profile",
                         "quality": "Original HD · 1080×1080",
@@ -763,6 +818,42 @@ def extract_tiktok(url: str, is_profile: bool, handle: Optional[str]) -> Dict[st
                     })
         except Exception:
             pass
+
+        if not media:
+            try:
+                resp = requests.get(
+                    f"https://www.tikwm.com/api/user/info?unique_id={target_handle}",
+                    headers={"User-Agent": DESKTOP_UA},
+                    timeout=8,
+                )
+                if resp.ok:
+                    user = (resp.json().get("data") or {}).get("user") or {}
+                    hd_av = user.get("avatarLarger") or user.get("avatarMedium") or user.get("avatarThumb")
+                    if hd_av:
+                        creator["handle"] = user.get("uniqueId") or target_handle
+                        creator["name"] = user.get("nickname") or creator["handle"]
+                        creator["verified"] = bool(user.get("verified"))
+                        creator["profileUrl"] = f"https://www.tiktok.com/@{creator['handle']}"
+                        caption = user.get("signature") or ""
+                        title = f"{creator['name']} (@{creator['handle']})"
+                        proxied = build_stream_url(hd_av, f"{creator['handle']}-avatar.jpg", True)
+                        creator["avatarUrl"] = proxied
+                        thumbnail = proxied
+                        media.append({
+                            "url": proxied,
+                            "rawUrl": hd_av,
+                            "downloadUrl": build_stream_url(hd_av, f"{creator['handle']}-profile-photo-hd.jpg", False),
+                            "thumbnail": proxied,
+                            "type": "profile",
+                            "quality": "Original HD · 1080×1080",
+                            "format": "jpg",
+                            "width": 1080,
+                            "height": 1080,
+                            "aspectRatio": "square",
+                            "hasAudio": False,
+                        })
+            except Exception:
+                pass
         return {
             "title": title or f"@{target_handle}",
             "caption": caption,
@@ -830,17 +921,61 @@ def extract_tiktok(url: str, is_profile: bool, handle: Optional[str]) -> Dict[st
                     audio_url = raw_music if raw_music.startswith("http") else f"https://www.tikwm.com{raw_music}"
                     audio_available = True
 
+                sd_url = d.get("play")
+                hd_url = d.get("hdplay")
                 images = d.get("images")
-                if isinstance(images, list) and images:
-                    is_carousel = len(images) > 1
+                w = d.get("width") or 1080
+                h = d.get("height") or 1920
+                aspect_ratio = compute_aspect_ratio(w, h, "vertical")
+                has_video = bool(sd_url or hd_url)
+                has_images = isinstance(images, list) and len(images) > 0
+
+                if sd_url:
+                    full_sd = sd_url if sd_url.startswith("http") else f"https://www.tikwm.com{sd_url}"
+                    media.append({
+                        "url": build_stream_url(full_sd, safe_filename(title, "mp4"), True),
+                        "rawUrl": full_sd,
+                        "downloadUrl": build_stream_url(full_sd, safe_filename(f"{title}-watermark-free", "mp4"), False),
+                        "thumbnail": thumbnail,
+                        "type": "video",
+                        "quality": "Clean Story Video (Watermark-Free) · 1080p" if is_story else "Clean Video (Watermark-Free) · 1080p",
+                        "format": "mp4",
+                        "width": w,
+                        "height": h,
+                        "aspectRatio": aspect_ratio,
+                        "hasAudio": True,
+                    })
+                    audio_available = True
+
+                if hd_url and hd_url != sd_url:
+                    full_hd = hd_url if hd_url.startswith("http") else f"https://www.tikwm.com{hd_url}"
+                    media.append({
+                        "url": build_stream_url(full_hd, safe_filename(title, "mp4"), True),
+                        "rawUrl": full_hd,
+                        "downloadUrl": build_stream_url(full_hd, safe_filename(f"{title}-hd-1080p", "mp4"), False),
+                        "thumbnail": thumbnail,
+                        "type": "video",
+                        "quality": "Full HD · 1080p",
+                        "format": "mp4",
+                        "width": w,
+                        "height": h,
+                        "aspectRatio": aspect_ratio,
+                        "hasAudio": True,
+                    })
+                    audio_available = True
+
+                if has_images:
+                    if not has_video:
+                        is_carousel = len(images) > 1
                     for idx, img_url in enumerate(images):
                         if not img_url:
                             continue
-                        proxied = build_stream_url(img_url, f"slide-{idx+1}.jpg", True)
+                        full_img = img_url if img_url.startswith("http") else f"https://www.tikwm.com{img_url}"
+                        proxied = build_stream_url(full_img, f"slide-{idx+1}.jpg", True)
                         media.append({
                             "url": proxied,
-                            "rawUrl": img_url,
-                            "downloadUrl": build_stream_url(img_url, safe_filename(f"{title}-slide-{idx+1}", "jpg"), False),
+                            "rawUrl": full_img,
+                            "downloadUrl": build_stream_url(full_img, safe_filename(f"{title}-slide-{idx+1}", "jpg"), False),
                             "thumbnail": proxied,
                             "type": "image",
                             "quality": f"Slide {idx+1} · Full HD",
@@ -850,44 +985,9 @@ def extract_tiktok(url: str, is_profile: bool, handle: Optional[str]) -> Dict[st
                             "aspectRatio": "vertical",
                             "hasAudio": False,
                         })
-                else:
-                    is_carousel = False
-                    hd_url = d.get("hdplay")
-                    sd_url = d.get("play")
-                    w = d.get("width") or 1080
-                    h = d.get("height") or 1920
-                    if hd_url:
-                        full_hd = hd_url if hd_url.startswith("http") else f"https://www.tikwm.com{hd_url}"
-                        media.append({
-                            "url": build_stream_url(full_hd, safe_filename(title, "mp4"), True),
-                            "rawUrl": full_hd,
-                            "downloadUrl": build_stream_url(full_hd, safe_filename(f"{title}-1080p", "mp4"), False),
-                            "thumbnail": thumbnail,
-                            "type": "video",
-                            "quality": "Full HD · 1080p",
-                            "format": "mp4",
-                            "width": w,
-                            "height": h,
-                            "aspectRatio": compute_aspect_ratio(w, h, "vertical"),
-                            "hasAudio": True,
-                        })
-                        audio_available = True
-                    if sd_url and sd_url != hd_url:
-                        full_sd = sd_url if sd_url.startswith("http") else f"https://www.tikwm.com{sd_url}"
-                        media.append({
-                            "url": build_stream_url(full_sd, safe_filename(title, "mp4"), True),
-                            "rawUrl": full_sd,
-                            "downloadUrl": build_stream_url(full_sd, safe_filename(f"{title}-720p", "mp4"), False),
-                            "thumbnail": thumbnail,
-                            "type": "video",
-                            "quality": "HD · 720p" if hd_url else "Full HD · 1080p",
-                            "format": "mp4",
-                            "width": 720 if hd_url else w,
-                            "height": 1280 if hd_url else h,
-                            "aspectRatio": compute_aspect_ratio(w, h, "vertical"),
-                            "hasAudio": True,
-                        })
-                        audio_available = True
+
+                if not thumbnail and media:
+                    thumbnail = media[0].get("thumbnail") or media[0].get("url")
     except Exception:
         pass
 
@@ -1100,35 +1200,52 @@ def extract_youtube(target_url: str, is_profile: bool, profile_handle: Optional[
 
     # 2. Video / Shorts Mode
     if not media:
-        # Strategy A: Standard yt-dlp to extract all video resolutions (4K, 1440p, 1080p, 720p, 480p)
+        yt_bin = "/bin/yt-dlp" if os.path.exists("/bin/yt-dlp") else "yt-dlp"
+
+        # Strategy A: Standard yt-dlp with full progressive/merged formats (up to 4K / 2160p)
         try:
-            cmd = ["yt-dlp", "--dump-single-json", "--no-warnings", target_url]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            cmd = [yt_bin, "--dump-single-json", "--no-warnings", target_url]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
             if proc.returncode == 0 and proc.stdout.strip():
                 yt_data = json.loads(proc.stdout)
         except Exception:
             pass
 
-        # Strategy B: Bot bypass fallback with android,web
+        # Strategy B: Bot bypass fallback with android client
         if not yt_data:
-            for client_arg in ["youtube:player_client=android,web", "youtube:player_client=web,default"]:
-                try:
-                    cmd = [
-                        "yt-dlp",
-                        "--dump-single-json",
-                        "--no-warnings",
-                        "--extractor-args",
-                        client_arg,
-                        target_url,
-                    ]
-                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-                    if proc.returncode == 0 and proc.stdout.strip():
-                        yt_data = json.loads(proc.stdout)
-                        break
-                except Exception:
-                    continue
+            try:
+                cmd = [
+                    yt_bin,
+                    "--dump-single-json",
+                    "--no-warnings",
+                    "--extractor-args",
+                    "youtube:player_client=android",
+                    target_url,
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    yt_data = json.loads(proc.stdout)
+            except Exception:
+                pass
 
-        # Invidious fallback
+        # Strategy C: Bot bypass fallback with android,web
+        if not yt_data:
+            try:
+                cmd = [
+                    yt_bin,
+                    "--dump-single-json",
+                    "--no-warnings",
+                    "--extractor-args",
+                    "youtube:player_client=android,web",
+                    target_url,
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    yt_data = json.loads(proc.stdout)
+            except Exception:
+                pass
+
+        # Strategy D: Invidious fallback
         if not yt_data:
             video_id = ""
             parsed = urlparse(target_url)
@@ -1176,20 +1293,25 @@ def extract_youtube(target_url: str, is_profile: bool, profile_handle: Optional[
             default_aspect = "vertical" if is_shorts else "horizontal"
 
             raw_formats = yt_data.get("formats") or yt_data.get("formatStreams") or []
-            target_heights = [2160, 1440, 1080, 720, 480, 360]
+            heights_found = [f.get("height") or 0 for f in raw_formats if f.get("height")]
+            max_height = max(heights_found) if heights_found else 1080
 
-            audio_streams = [f for f in raw_formats if f.get("acodec") and f.get("acodec") != "none" and f.get("url")]
-            if audio_streams or yt_data.get("id"):
-                audio_available = True
-                audio_url = audio_streams[0]["url"] if audio_streams else target_url
+            progressive_format = next(
+                (f for f in raw_formats if f.get("vcodec") and f["vcodec"] != "none" and f.get("acodec") and f["acodec"] != "none" and f.get("url") and "manifest.googlevideo.com" not in f["url"]),
+                next((f for f in raw_formats if f.get("format_id") == "18" and f.get("url")), None)
+            )
+            preview_url = (progressive_format.get("url") if progressive_format else None) or next((f["url"] for f in raw_formats if f.get("url") and f.get("vcodec") != "none"), target_url)
 
-            for h in target_heights:
-                matching = [f for f in raw_formats if f.get("height") == h and f.get("url") and f.get("vcodec") != "none"]
-                if not matching:
-                    continue
-                matching.sort(key=lambda x: (1 if x.get("ext") == "mp4" else 0, x.get("tbr") or 0), reverse=True)
-                chosen = matching[0]
+            audio_available = True
+            audio_url = target_url
 
+            target_ladder = [2160, 1440, 1080, 720, 480, 360]
+            valid_heights = [h for h in target_ladder if h <= max_height or h == 720 or h == 360]
+            if max_height >= 1080 and 1080 not in valid_heights:
+                valid_heights.append(1080)
+            valid_heights.sort(reverse=True)
+
+            for idx, h in enumerate(valid_heights):
                 q_name = f"{h}p"
                 if h >= 2160: q_name = "4K · 2160p"
                 elif h >= 1440: q_name = "QHD · 1440p"
@@ -1198,22 +1320,20 @@ def extract_youtube(target_url: str, is_profile: bool, profile_handle: Optional[
                 elif h >= 480: q_name = "SD · 480p"
                 else: q_name = "SD · 360p"
 
-                has_audio = bool(chosen.get("acodec") and chosen["acodec"] != "none")
-                ext = chosen.get("ext") or "mp4"
-                w = chosen.get("width") or (3840 if h == 2160 else 2560 if h == 1440 else 1920 if h == 1080 else 1280 if h == 720 else 854)
+                w = (1215 if h == 2160 else 810 if h == 1440 else 608 if h == 1080 else 405 if h == 720 else 270) if is_shorts else (3840 if h == 2160 else 2560 if h == 1440 else 1920 if h == 1080 else 1280 if h == 720 else 854)
 
                 media.append({
-                    "url": build_stream_url(chosen["url"], safe_filename(f"{title}-{h}p", ext), True),
-                    "rawUrl": chosen["url"],
-                    "downloadUrl": build_stream_url(chosen["url"], safe_filename(f"{title}-{h}p", ext), False),
+                    "url": build_stream_url(preview_url, safe_filename(f"{title}-{h}p", "mp4"), True),
+                    "rawUrl": target_url,
+                    "downloadUrl": f"/api/download?downloadId=pending&format=mp4&assetType=media&mediaIndex={idx}",
                     "thumbnail": thumbnail,
                     "type": "video",
                     "quality": q_name,
-                    "format": ext,
+                    "format": "mp4",
                     "width": w,
                     "height": h,
                     "aspectRatio": compute_aspect_ratio(w, h, default_aspect),
-                    "hasAudio": has_audio,
+                    "hasAudio": True,
                 })
 
             if not media:
@@ -1407,8 +1527,28 @@ def highlight_route(payload: HighlightRequest):
     path_parts = [p for p in parsed.path.split("/") if p]
     is_highlight = len(path_parts) >= 2 and path_parts[0] == "stories" and path_parts[1] == "highlights"
     highlight_id = path_parts[2] if is_highlight and len(path_parts) > 2 else None
+
+    # Parse query params (e.g. ?story_media_id=3628878983900849427_16080427485)
+    query_params = parse_qs(parsed.query)
+    raw_sm_id = query_params.get("story_media_id", [None])[0]
+    story_media_id = raw_sm_id.split("_")[0] if raw_sm_id else None
+
+    # Decode Base64 mobile share highlights (/s/aGlnaGxpZ2h0...)
+    if len(path_parts) >= 2 and path_parts[0] == "s":
+        try:
+            b64_str = path_parts[1].replace("-", "+").replace("_", "/")
+            while len(b64_str) % 4 != 0:
+                b64_str += "="
+            decoded = base64.b64decode(b64_str).decode("utf-8", errors="ignore")
+            m = re.search(r"highlight:(\d+)", decoded, re.I)
+            if m:
+                highlight_id = m.group(1)
+                is_highlight = True
+        except Exception:
+            pass
+
     story_username = path_parts[1] if len(path_parts) >= 2 and path_parts[0] == "stories" and path_parts[1] != "highlights" else None
-    story_id = path_parts[2] if story_username and len(path_parts) > 2 else None
+    story_id = (path_parts[2] if story_username and len(path_parts) > 2 else None) or story_media_id
 
     if story_username:
         creator["handle"] = story_username
@@ -1556,12 +1696,24 @@ def highlight_route(payload: HighlightRequest):
         except Exception:
             pass
 
-    # Engine 3: Instagram Embed Scraper (/embed/ and /embed/captioned/)
+    # Engine 3: Instagram Direct Shortcode Embed Scraper & Public Embed Mirrors
     if not stories:
-        candidates = [target_url, f"{target_url.rstrip('/')}/embed/captioned/", f"{target_url.rstrip('/')}/embed/"]
+        candidate_urls = []
         if story_id:
-            candidates.append(f"https://www.instagram.com/p/{story_id}/embed/captioned/")
-        for cand in candidates:
+            sc = id_to_shortcode(story_id)
+            if sc:
+                candidate_urls.append(f"https://www.instagram.com/p/{sc}/embed/captioned/")
+        if story_media_id:
+            sc = id_to_shortcode(story_media_id)
+            if sc and not any(sc in u for u in candidate_urls):
+                candidate_urls.append(f"https://www.instagram.com/p/{sc}/embed/captioned/")
+        candidate_urls.extend([
+            target_url,
+            f"{target_url.rstrip('/')}/embed/captioned/",
+            f"{target_url.rstrip('/')}/embed/"
+        ])
+
+        for cand in candidate_urls:
             if stories:
                 break
             try:
@@ -1578,109 +1730,78 @@ def highlight_route(payload: HighlightRequest):
 
                 if og_t and og_t.get("content"):
                     title = re.sub(r"\s*•\s*Instagram.*$", "", str(og_t["content"]), flags=re.I).strip()
-                if og_i and og_i.get("content") and not is_generic_instagram_logo(str(og_i["content"])):
-                    cover = build_stream_url(str(og_i["content"]), "cover.jpg", True)
 
-                # Direct extraction from internal script JSON payload for authentic story media
-                script_matches = re.findall(r"<script[^>]*>([\s\S]*?)</script>", html, re.I)
-                for script_body in script_matches:
-                    if not script_body or ("video_versions" not in script_body and "image_versions2" not in script_body and "display_url" not in script_body):
-                        continue
-                    vid_m = re.search(r'"video_versions":\s*\[\s*\{\s*"url":\s*"([^"]+)"', script_body)
-                    img_m = re.search(r'"image_versions2":\s*\{\s*"candidates":\s*\[\s*\{\s*"url":\s*"([^"]+)"', script_body)
-                    disp_m = re.search(r'"display_url":\s*"([^"]+)"', script_body)
+                username_el = soup.find(class_="Username")
+                if username_el:
+                    uname = username_el.get_text(strip=True).split()[0]
+                    uname = re.sub(r"Verified.*$", "", uname, flags=re.I)
+                    if uname and not creator.get("handle"):
+                        creator["handle"] = uname
+                        creator["name"] = uname
+                        creator["profileUrl"] = f"https://www.instagram.com/{uname}/"
+                        if not title or title in ("Instagram Story", "Instagram Highlight"):
+                            title = f"@{uname}'s Story"
 
-                    direct_v = vid_m.group(1).encode().decode("unicode_escape") if vid_m else None
-                    direct_i = (img_m.group(1).encode().decode("unicode_escape") if img_m else None) or (disp_m.group(1).encode().decode("unicode_escape") if disp_m else None)
+                # 1. Direct .mp4 video stream scan
+                direct_v = None
+                mp4_idx = html.find(".mp4")
+                if mp4_idx != -1:
+                    start = html.rfind("https:", 0, mp4_idx)
+                    end = html.find('"', mp4_idx)
+                    if start != -1 and end != -1 and end > start:
+                        raw = html[start:end]
+                        try:
+                            raw = json.loads(f'"{raw}"')
+                        except Exception:
+                            raw = raw.replace(r"\/", "/").replace(r"\u0026", "&").replace("\\", "")
+                        if not is_generic_instagram_logo(raw):
+                            direct_v = raw
 
-                    if direct_v and not is_generic_instagram_logo(direct_v) and not stories:
-                        stream_u = build_stream_url(direct_v, "story-1.mp4", True)
-                        dl_u = build_stream_url(direct_v, safe_filename(f"{title}-story-1", "mp4"), False)
-                        thumb_u = build_stream_url(direct_i, "thumb.jpg", True) if (direct_i and not is_generic_instagram_logo(direct_i)) else None
-                        stories.append({
-                            "storyNumber": 1,
-                            "mediaIndex": 0,
-                            "type": "video",
-                            "duration": 15,
-                            "thumbnail": thumb_u,
-                            "createdAt": time.strftime("%Y-%m-%d"),
-                            "url": stream_u,
-                            "downloadUrl": dl_u,
-                        })
-                        media.append({
-                            "url": stream_u,
-                            "rawUrl": direct_v,
-                            "downloadUrl": dl_u,
-                            "thumbnail": thumb_u,
-                            "type": "video",
-                            "quality": "Full HD · 1080p",
-                            "format": "mp4",
-                            "width": 1080,
-                            "height": 1920,
-                            "aspectRatio": "vertical",
-                            "hasAudio": True,
-                        })
-                        break
-                    elif direct_i and not is_generic_instagram_logo(direct_i) and not stories:
-                        stream_u = build_stream_url(direct_i, "story-1.jpg", True)
-                        dl_u = build_stream_url(direct_i, safe_filename(f"{title}-story-1", "jpg"), False)
-                        stories.append({
-                            "storyNumber": 1,
-                            "mediaIndex": 0,
-                            "type": "photo",
-                            "duration": None,
-                            "thumbnail": stream_u,
-                            "createdAt": time.strftime("%Y-%m-%d"),
-                            "url": stream_u,
-                            "downloadUrl": dl_u,
-                        })
-                        media.append({
-                            "url": stream_u,
-                            "rawUrl": direct_i,
-                            "downloadUrl": dl_u,
-                            "thumbnail": stream_u,
-                            "type": "image",
-                            "quality": "Original HD",
-                            "format": "jpg",
-                            "width": 1080,
-                            "height": 1920,
-                            "aspectRatio": "vertical",
-                            "hasAudio": False,
-                        })
-                        break
+                if not direct_v and og_v and og_v.get("content") and not is_generic_instagram_logo(str(og_v["content"])):
+                    direct_v = str(og_v["content"])
 
-                if not stories and og_v and og_v.get("content"):
-                    raw_v = str(og_v["content"])
-                    if not is_generic_instagram_logo(raw_v):
-                        stream_u = build_stream_url(raw_v, "story-1.mp4", True)
-                        dl_u = build_stream_url(raw_v, safe_filename(f"{title}-story-1", "mp4"), False)
-                        stories.append({
-                            "storyNumber": 1,
-                            "mediaIndex": 0,
-                            "type": "video",
-                            "duration": 15,
-                            "thumbnail": cover,
-                            "createdAt": time.strftime("%Y-%m-%d"),
-                            "url": stream_u,
-                            "downloadUrl": dl_u,
-                        })
-                        media.append({
-                            "url": stream_u,
-                            "rawUrl": raw_v,
-                            "downloadUrl": dl_u,
-                            "thumbnail": cover,
-                            "type": "video",
-                            "quality": "Full HD · 1080p",
-                            "format": "mp4",
-                            "width": 1080,
-                            "height": 1920,
-                            "aspectRatio": "vertical",
-                            "hasAudio": True,
-                        })
-                elif not stories and og_i and og_i.get("content") and not is_generic_instagram_logo(str(og_i["content"])):
-                    raw_i = str(og_i["content"])
-                    stream_u = build_stream_url(raw_i, "story-1.jpg", True)
-                    dl_u = build_stream_url(raw_i, safe_filename(f"{title}-story-1", "jpg"), False)
+                # 2. Direct high-res photo scan
+                direct_i = None
+                emb_img = soup.find("img", class_="EmbeddedMediaImage")
+                if emb_img and emb_img.get("src") and not is_generic_instagram_logo(str(emb_img["src"])):
+                    direct_i = str(emb_img["src"])
+                elif og_i and og_i.get("content") and not is_generic_instagram_logo(str(og_i["content"])):
+                    direct_i = str(og_i["content"])
+
+                if direct_i and not cover:
+                    cover = build_stream_url(direct_i, "cover.jpg", True)
+
+                if direct_v and not is_generic_instagram_logo(direct_v):
+                    stream_u = build_stream_url(direct_v, "story-1.mp4", True)
+                    dl_u = build_stream_url(direct_v, safe_filename(f"{title}-story-1", "mp4"), False)
+                    thumb_u = build_stream_url(direct_i, "thumb.jpg", True) if direct_i else cover
+                    stories.append({
+                        "storyNumber": 1,
+                        "mediaIndex": 0,
+                        "type": "video",
+                        "duration": 15,
+                        "thumbnail": thumb_u,
+                        "createdAt": time.strftime("%Y-%m-%d"),
+                        "url": stream_u,
+                        "downloadUrl": dl_u,
+                    })
+                    media.append({
+                        "url": stream_u,
+                        "rawUrl": direct_v,
+                        "downloadUrl": dl_u,
+                        "thumbnail": thumb_u,
+                        "type": "video",
+                        "quality": "Full HD · 1080p",
+                        "format": "mp4",
+                        "width": 1080,
+                        "height": 1920,
+                        "aspectRatio": "vertical",
+                        "hasAudio": True,
+                    })
+                    break
+                elif direct_i and not is_generic_instagram_logo(direct_i):
+                    stream_u = build_stream_url(direct_i, "story-1.jpg", True)
+                    dl_u = build_stream_url(direct_i, safe_filename(f"{title}-story-1", "jpg"), False)
                     stories.append({
                         "storyNumber": 1,
                         "mediaIndex": 0,
@@ -1693,7 +1814,7 @@ def highlight_route(payload: HighlightRequest):
                     })
                     media.append({
                         "url": stream_u,
-                        "rawUrl": raw_i,
+                        "rawUrl": direct_i,
                         "downloadUrl": dl_u,
                         "thumbnail": stream_u,
                         "type": "image",
@@ -1704,6 +1825,7 @@ def highlight_route(payload: HighlightRequest):
                         "aspectRatio": "vertical",
                         "hasAudio": False,
                     })
+                    break
             except Exception:
                 pass
 
@@ -1785,27 +1907,35 @@ def download_route(payload: DownloadRequest):
 
     cached = RESULT_CACHE.get(payload.downloadId) if payload.downloadId else None
     target_url = payload.url
+    media_list = cached.get("media", []) if cached else []
+    idx = payload.mediaIndex if payload.mediaIndex is not None else 0
+
     if not target_url and cached:
-        idx = payload.mediaIndex if payload.mediaIndex is not None else 0
-        media_list = cached.get("media", [])
         if media_list and idx < len(media_list):
             target_url = media_list[idx].get("rawUrl") or media_list[idx].get("url")
 
     if not target_url:
         raise HTTPException(status_code=404, detail="Media URL not found.")
 
+    if is_generic_instagram_logo(target_url):
+        raise HTTPException(status_code=400, detail="Cannot download static logo assets. Story media is not directly downloadable.")
+
     is_yt = ("youtube.com" in target_url or "youtu.be" in target_url or (cached and cached.get("platform") == "youtube"))
     clean_name = safe_filename(payload.filename or "media", "mp4")
 
     if is_yt:
+        yt_bin = "/bin/yt-dlp" if os.path.exists("/bin/yt-dlp") else (os.path.abspath("bin/yt-dlp") if os.path.exists("bin/yt-dlp") else "yt-dlp")
         src_url = (cached.get("sourceUrl") if cached else None) or target_url
         if payload.assetType == "audio" or payload.format == "mp3":
             tmp_audio = f"/tmp/omni-py-audio-{uuid.uuid4().hex}.mp3"
             cmd = [
-                "yt-dlp",
+                yt_bin,
+                "-f", "bestaudio/best",
                 "-x",
                 "--audio-format", "mp3",
                 "--audio-quality", "320k",
+                "--ffmpeg-location", "/usr/bin/ffmpeg",
+                "--extractor-args", "youtube:player_client=android,web",
                 "--no-warnings",
                 "-o", tmp_audio,
                 src_url,
@@ -1818,15 +1948,17 @@ def download_route(payload: DownloadRequest):
             media_item = media_list[idx] if media_list and idx < len(media_list) else None
             target_height = media_item.get("height") if media_item else None
             format_spec = (
-                f"bestvideo[height<={target_height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={target_height}]+bestaudio/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+                f"bestvideo[height<={target_height}]+bestaudio/best[ext=mp4]/best"
                 if target_height
-                else "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+                else "bestvideo+bestaudio/best[ext=mp4]/best"
             )
             tmp_vid = f"/tmp/omni-py-vid-{uuid.uuid4().hex}.mp4"
             cmd = [
-                "yt-dlp",
+                yt_bin,
                 "-f", format_spec,
                 "--merge-output-format", "mp4",
+                "--ffmpeg-location", "/usr/bin/ffmpeg",
+                "--extractor-args", "youtube:player_client=android,web",
                 "--no-warnings",
                 "-o", tmp_vid,
                 src_url,
@@ -1835,6 +1967,20 @@ def download_route(payload: DownloadRequest):
             if os.path.exists(tmp_vid):
                 fname = clean_name if clean_name.endswith(".mp4") else f"{clean_name.rsplit('.', 1)[0]}.mp4"
                 return FileResponse(tmp_vid, media_type="video/mp4", filename=fname)
+
+    if payload.assetType == "audio" or payload.format == "mp3":
+        tmp_audio = f"/tmp/omni-py-audio-{uuid.uuid4().hex}.mp3"
+        try:
+            subprocess.run(
+                ["/usr/bin/ffmpeg", "-i", target_url, "-vn", "-acodec", "libmp3lame", "-b:a", "320k", "-y", tmp_audio],
+                timeout=60,
+                check=True,
+            )
+            if os.path.exists(tmp_audio):
+                fname = clean_name if clean_name.endswith(".mp3") else f"{clean_name.rsplit('.', 1)[0]}.mp3"
+                return FileResponse(tmp_audio, media_type="audio/mpeg", filename=fname)
+        except Exception:
+            pass
 
     r = requests.get(target_url, headers={"User-Agent": DESKTOP_UA}, timeout=25)
     if not r.ok:

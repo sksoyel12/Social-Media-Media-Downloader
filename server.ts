@@ -20,6 +20,23 @@ import type {
 const PORT = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === "production";
 
+const binDir = path.resolve(process.cwd(), "bin");
+export const ytDlpPath = fs.existsSync(path.resolve(binDir, "yt-dlp"))
+  ? path.resolve(binDir, "yt-dlp")
+  : "yt-dlp";
+
+try {
+  if (fs.existsSync(ytDlpPath)) {
+    fs.chmodSync(ytDlpPath, 0o755);
+  }
+} catch {}
+
+if (!process.env.PATH?.includes(binDir)) {
+  process.env.PATH = `${binDir}:${process.env.PATH || ""}`;
+}
+
+const execFileAsync = promisify(execFile);
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
@@ -124,25 +141,87 @@ function computeAspectRatio(
   return "square";
 }
 
+function idToShortcode(idStr: string | null | undefined): string {
+  if (!idStr) return "";
+  try {
+    const cleanDigits = idStr.split("_")[0]?.replace(/\D+/g, "") || "";
+    if (!cleanDigits) return "";
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let id = BigInt(cleanDigits);
+    let shortcode = "";
+    while (id > 0n) {
+      const remainder = Number(id % 64n);
+      shortcode = alphabet[remainder] + shortcode;
+      id = id / 64n;
+    }
+    return shortcode;
+  } catch {
+    return "";
+  }
+}
+
 function isGenericInstagramLogo(url: string | null | undefined): boolean {
   if (!url) return true;
   const lower = url.toLowerCase();
   return (
     lower.includes("instagram_logo") ||
     lower.includes("instagram-logo") ||
+    lower.includes("instagramlogo") ||
+    lower.includes("instagram_icon") ||
+    lower.includes("instagram-icon") ||
+    lower.includes("brand_assets") ||
+    lower.includes("brand-assets") ||
+    lower.includes("brandassets") ||
     lower.includes("4168x4168") ||
     lower.includes("static.cdninstagram.com") ||
     lower.includes("/rsrc.php/") ||
     lower.includes("/static/images/") ||
-    lower.includes("brand_assets") ||
+    lower.includes("/static/rsrc/") ||
     lower.includes("favicon") ||
-    lower.includes("instagram_icon") ||
     lower.includes("ig_icon") ||
     lower.includes("apple-touch-icon") ||
-    lower.includes("logo") ||
     lower.includes("play-button") ||
     lower.includes("transparent.png") ||
-    lower.includes("spacer.gif")
+    lower.includes("spacer.gif") ||
+    lower.includes("sprite") ||
+    lower.includes("glyph") ||
+    lower.includes("meta_logo") ||
+    lower.includes("instagram-app") ||
+    lower.includes("fbcdn.net/rsrc.php") ||
+    lower.includes("150x150") ||
+    lower.includes("100x100") ||
+    /logo.*\.(?:png|jpg|jpeg|svg|webp)/i.test(lower) ||
+    /instagram[_-]?(?:glyph|brand|icon|wordmark|logo)/i.test(lower)
+  );
+}
+
+function isAuthenticStoryMedia(url: string | null | undefined): boolean {
+  if (!url) return false;
+  if (isGenericInstagramLogo(url)) return false;
+  const lower = url.toLowerCase();
+  if (
+    lower.includes("instagram_logo") ||
+    lower.includes("brand_assets") ||
+    lower.includes("static.cdninstagram.com") ||
+    lower.includes("/rsrc.php/") ||
+    lower.includes("/static/")
+  ) {
+    return false;
+  }
+  const isCdn =
+    lower.includes("cdninstagram.com") ||
+    lower.includes("fbcdn.net") ||
+    lower.includes("instagram.");
+  if (!isCdn) return false;
+  return (
+    lower.includes(".mp4") ||
+    lower.includes(".jpg") ||
+    lower.includes(".jpeg") ||
+    lower.includes("/v/t51.") ||
+    lower.includes("_nc_cat") ||
+    lower.includes("_nc_sid") ||
+    lower.includes("/o1/v/") ||
+    lower.includes("video")
   );
 }
 
@@ -226,7 +305,7 @@ function sanitizeTrackingParams(urlStr: string): string {
     ) {
       parsed.search = "";
       parsed.hash = "";
-      if (storyMediaId && parsed.pathname.includes("/stories/")) {
+      if (storyMediaId && (parsed.pathname.includes("/stories/") || parsed.pathname.startsWith("/s/"))) {
         parsed.searchParams.set("story_media_id", storyMediaId);
       }
       return parsed.toString();
@@ -540,49 +619,97 @@ async function extractTikTok(
       "";
 
     if (handle) {
+      // Strategy 1: TikTok embed page scraper (bypasses Cloudflare & datacenter IP blocks, extracts 1080p DP)
       try {
-        const apiRes = await fetch(
-          `https://www.tikwm.com/api/user/info?unique_id=${encodeURIComponent(handle)}`,
+        const embedRes = await fetch(
+          `https://www.tiktok.com/embed/@${encodeURIComponent(handle)}`,
           {
             headers: {
-              "User-Agent": DESKTOP_UA,
-              Accept: "application/json",
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
             },
             signal: AbortSignal.timeout(8000),
           }
         );
-        if (apiRes.ok) {
-          const payload = await apiRes.json();
-          const user = payload?.data?.user;
-          if (user) {
-            const hdAvatar = user.avatarLarger || user.avatarMedium || user.avatarThumb;
-            creator.handle = user.uniqueId || handle;
-            creator.name = user.nickname || handle;
-            creator.verified = Boolean(user.verified);
-            creator.profileUrl = `https://www.tiktok.com/@${creator.handle}`;
-            if (hdAvatar) {
-              creator.avatarUrl = buildStreamUrl(hdAvatar, `${creator.handle}-avatar.jpg`, true);
-              thumbnail = creator.avatarUrl;
-              caption = user.signature || "";
-              title = `${creator.name} (@${creator.handle})`;
-              media.push({
-                url: creator.avatarUrl,
-                rawUrl: hdAvatar,
-                downloadUrl: buildStreamUrl(hdAvatar, `${creator.handle}-profile-photo.jpg`, false),
-                thumbnail: creator.avatarUrl,
-                type: "profile",
-                quality: "Original HD · 1080×1080",
-                format: "jpg",
-                width: 1080,
-                height: 1080,
-                aspectRatio: "square",
-                hasAudio: false,
-              });
-            }
+        if (embedRes.ok) {
+          const html = await embedRes.text();
+          const avatarMatch = html.match(
+            /https:\/\/[^"'\s]+(?:avt|avatar|tiktokcdn)[^"'\s]+tplv-tiktokx-cropcenter:[^"'\s]+/i
+          );
+          if (avatarMatch?.[0]) {
+            const rawAvatar = avatarMatch[0].replace(/&amp;/g, "&");
+            const hdAvatar = rawAvatar.replace(/cropcenter:\d+:\d+/, "cropcenter:1080:1080");
+            creator.handle = handle;
+            creator.name = handle;
+            creator.profileUrl = `https://www.tiktok.com/@${handle}`;
+            const proxiedAvatar = buildStreamUrl(hdAvatar, `${handle}-avatar.jpg`, true);
+            creator.avatarUrl = proxiedAvatar;
+            thumbnail = proxiedAvatar;
+            title = `${handle} (@${handle})`;
+            media.push({
+              url: proxiedAvatar,
+              rawUrl: hdAvatar,
+              downloadUrl: buildStreamUrl(hdAvatar, `${handle}-profile-photo.jpg`, false),
+              thumbnail: proxiedAvatar,
+              type: "profile",
+              quality: "Original HD · 1080×1080",
+              format: "jpg",
+              width: 1080,
+              height: 1080,
+              aspectRatio: "square",
+              hasAudio: false,
+            });
           }
         }
       } catch {
-        // Fallback to HTML hydration below
+        // Fallback to TikWM user info below
+      }
+
+      if (media.length === 0) {
+        try {
+          const apiRes = await fetch(
+            `https://www.tikwm.com/api/user/info?unique_id=${encodeURIComponent(handle)}`,
+            {
+              headers: {
+                "User-Agent": DESKTOP_UA,
+                Accept: "application/json",
+              },
+              signal: AbortSignal.timeout(8000),
+            }
+          );
+          if (apiRes.ok) {
+            const payload = await apiRes.json();
+            const user = payload?.data?.user;
+            if (user) {
+              const hdAvatar = user.avatarLarger || user.avatarMedium || user.avatarThumb;
+              creator.handle = user.uniqueId || handle;
+              creator.name = user.nickname || handle;
+              creator.verified = Boolean(user.verified);
+              creator.profileUrl = `https://www.tiktok.com/@${creator.handle}`;
+              if (hdAvatar) {
+                creator.avatarUrl = buildStreamUrl(hdAvatar, `${creator.handle}-avatar.jpg`, true);
+                thumbnail = creator.avatarUrl;
+                caption = user.signature || "";
+                title = `${creator.name} (@${creator.handle})`;
+                media.push({
+                  url: creator.avatarUrl,
+                  rawUrl: hdAvatar,
+                  downloadUrl: buildStreamUrl(hdAvatar, `${creator.handle}-profile-photo.jpg`, false),
+                  thumbnail: creator.avatarUrl,
+                  type: "profile",
+                  quality: "Original HD · 1080×1080",
+                  format: "jpg",
+                  width: 1080,
+                  height: 1080,
+                  aspectRatio: "square",
+                  hasAudio: false,
+                });
+              }
+            }
+          }
+        } catch {
+          // Fallback to HTML hydration below
+        }
       }
     }
 
@@ -739,20 +866,76 @@ async function extractTikTok(
           audioAvailable = true;
         }
 
-        // Photo Slideshow vs Video Post
-        if (Array.isArray(d.images) && d.images.length > 0) {
-          isCarousel = d.images.length > 1;
+        const isStoryPost = isStory || Boolean(d.is_story) || targetUrl.includes("/story/");
+        const cleanPlayUrl = d.play
+          ? d.play.startsWith("http")
+            ? d.play
+            : `https://www.tikwm.com${d.play}`
+          : null;
+        const hdUrl = d.hdplay
+          ? d.hdplay.startsWith("http")
+            ? d.hdplay
+            : `https://www.tikwm.com${d.hdplay}`
+          : null;
+
+        const width = d.width || 1080;
+        const height = d.height || 1920;
+        const aspectRatio = computeAspectRatio(width, height, "vertical");
+        const hasVideo = Boolean(cleanPlayUrl || hdUrl);
+        const hasImages = Array.isArray(d.images) && d.images.length > 0;
+
+        // If clean watermark-free video stream exists, add it as primary media stream for CupertinoVideoPlayer
+        if (cleanPlayUrl) {
+          media.push({
+            url: buildStreamUrl(cleanPlayUrl, safeFilename(title, "mp4"), true),
+            rawUrl: cleanPlayUrl,
+            downloadUrl: buildStreamUrl(cleanPlayUrl, safeFilename(`${title}-watermark-free`, "mp4"), false),
+            thumbnail,
+            type: "video",
+            quality: isStoryPost ? "Clean Story Video (Watermark-Free) · 1080p" : "Clean Video (Watermark-Free) · 1080p",
+            format: "mp4",
+            width,
+            height,
+            aspectRatio,
+            hasAudio: true,
+          });
+          audioAvailable = true;
+        }
+
+        if (hdUrl && hdUrl !== cleanPlayUrl) {
+          media.push({
+            url: buildStreamUrl(hdUrl, safeFilename(title, "mp4"), true),
+            rawUrl: hdUrl,
+            downloadUrl: buildStreamUrl(hdUrl, safeFilename(`${title}-hd-1080p`, "mp4"), false),
+            thumbnail,
+            type: "video",
+            quality: "Full HD · 1080p",
+            format: "mp4",
+            width,
+            height,
+            aspectRatio,
+            hasAudio: true,
+          });
+          audioAvailable = true;
+        }
+
+        // Add slide photos if present (slideshows or photo stories)
+        if (hasImages) {
+          if (!hasVideo) {
+            isCarousel = d.images.length > 1;
+          }
           d.images.forEach((imgUrl: string, idx: number) => {
             if (!imgUrl) return;
-            const proxiedPreview = buildStreamUrl(imgUrl, `slide-${idx + 1}.jpg`, true);
+            const fullImg = imgUrl.startsWith("http") ? imgUrl : `https://www.tikwm.com${imgUrl}`;
+            const proxiedPreview = buildStreamUrl(fullImg, `slide-${idx + 1}.jpg`, true);
             const proxiedDownload = buildStreamUrl(
-              imgUrl,
+              fullImg,
               safeFilename(`${title}-slide-${idx + 1}`, "jpg"),
               false
             );
             media.push({
               url: proxiedPreview,
-              rawUrl: imgUrl,
+              rawUrl: fullImg,
               downloadUrl: proxiedDownload,
               thumbnail: proxiedPreview,
               type: "image",
@@ -764,60 +947,10 @@ async function extractTikTok(
               hasAudio: false,
             });
           });
-          if (!thumbnail && media[0]) {
-            thumbnail = media[0].url;
-          }
-        } else {
-          // Single Video post with selectable quality streams (NOT a carousel)
-          isCarousel = false;
-          const hdUrl = d.hdplay
-            ? d.hdplay.startsWith("http")
-              ? d.hdplay
-              : `https://www.tikwm.com${d.hdplay}`
-            : null;
-          const sdUrl = d.play
-            ? d.play.startsWith("http")
-              ? d.play
-              : `https://www.tikwm.com${d.play}`
-            : null;
+        }
 
-          const width = d.width || 1080;
-          const height = d.height || 1920;
-          const aspectRatio = computeAspectRatio(width, height, "vertical");
-
-          if (hdUrl) {
-            media.push({
-              url: buildStreamUrl(hdUrl, safeFilename(title, "mp4"), true),
-              rawUrl: hdUrl,
-              downloadUrl: buildStreamUrl(hdUrl, safeFilename(`${title}-1080p`, "mp4"), false),
-              thumbnail,
-              type: "video",
-              quality: "Full HD · 1080p",
-              format: "mp4",
-              width,
-              height,
-              aspectRatio,
-              hasAudio: true,
-            });
-            audioAvailable = true;
-          }
-
-          if (sdUrl && sdUrl !== hdUrl) {
-            media.push({
-              url: buildStreamUrl(sdUrl, safeFilename(title, "mp4"), true),
-              rawUrl: sdUrl,
-              downloadUrl: buildStreamUrl(sdUrl, safeFilename(`${title}-720p`, "mp4"), false),
-              thumbnail,
-              type: "video",
-              quality: hdUrl ? "HD · 720p" : "Full HD · 1080p",
-              format: "mp4",
-              width: hdUrl ? 720 : width,
-              height: hdUrl ? 1280 : height,
-              aspectRatio,
-              hasAudio: true,
-            });
-            audioAvailable = true;
-          }
+        if (!thumbnail && media[0]) {
+          thumbnail = media[0].thumbnail || media[0].url;
         }
       }
     } catch {
@@ -1365,11 +1498,81 @@ async function extractInstagram(
               hasAudio: false,
             });
           }
+        // Reel MP4 Video Scan from Embed HTML
+        if ((isReel || targetUrl.includes("/reel/") || html.includes(".mp4")) && media.every((m) => m.type !== "video")) {
+          const mp4Idx = html.indexOf(".mp4");
+          if (mp4Idx !== -1) {
+            const start = html.lastIndexOf("https:", mp4Idx);
+            const end = html.indexOf('"', mp4Idx);
+            if (start !== -1 && end !== -1 && end > start) {
+              let raw = html.slice(start, end);
+              try {
+                raw = JSON.parse(`"${raw}"`);
+              } catch {
+                raw = raw.replace(/\\\//g, "/").replace(/\\u0026/g, "&").replace(/\\/g, "");
+              }
+              if (isAuthenticStoryMedia(raw)) {
+                const proxiedVid = buildStreamUrl(raw, safeFilename(title || "instagram-reel", "mp4"), true);
+                const dlVid = buildStreamUrl(raw, safeFilename(title || "instagram-reel", "mp4"), false);
+                media.unshift({
+                  url: proxiedVid,
+                  rawUrl: raw,
+                  downloadUrl: dlVid,
+                  thumbnail: thumbnail || proxiedVid,
+                  type: "video",
+                  quality: "Full HD · 1080p",
+                  format: "mp4",
+                  width: 1080,
+                  height: 1920,
+                  aspectRatio: "vertical",
+                  hasAudio: true,
+                });
+                audioAvailable = true;
+                audioUrl = raw;
+              }
+            }
+          }
         }
       }
     } catch {
       // Fallback below
     }
+  }
+
+  // Fallback: yt-dlp scraper for Instagram Reels if video is missing
+  if (media.length === 0 || (isReel && media.every((m) => m.type !== "video"))) {
+    try {
+      const { stdout } = await execFileAsync(
+        ytDlpPath,
+        ["--dump-single-json", "--no-warnings", targetUrl],
+        { maxBuffer: 30 * 1024 * 1024, timeout: 15000 }
+      );
+      if (stdout) {
+        const ytd = JSON.parse(stdout);
+        const vidUrl = ytd.url || ytd.requested_formats?.[0]?.url || ytd.formats?.find((f: any) => f.url && f.ext === "mp4")?.url;
+        if (vidUrl) {
+          const proxiedVid = buildStreamUrl(vidUrl, safeFilename(title || ytd.title || "instagram-reel", "mp4"), true);
+          const dlVid = buildStreamUrl(vidUrl, safeFilename(title || ytd.title || "instagram-reel", "mp4"), false);
+          media.unshift({
+            url: proxiedVid,
+            rawUrl: vidUrl,
+            downloadUrl: dlVid,
+            thumbnail: ytd.thumbnail ? buildStreamUrl(ytd.thumbnail, "thumb.jpg", true) : thumbnail,
+            type: "video",
+            quality: "Full HD · 1080p",
+            format: "mp4",
+            width: ytd.width || 1080,
+            height: ytd.height || 1920,
+            aspectRatio: "vertical",
+            hasAudio: true,
+          });
+          audioAvailable = true;
+          audioUrl = vidUrl;
+          if (!title || title === "Instagram Post") title = ytd.title || title;
+          if (!caption) caption = ytd.description || "";
+        }
+      }
+    } catch {}
   }
 
   return {
@@ -1553,8 +1756,6 @@ async function extractPinterest(
 // YOUTUBE EXTRACTOR (Videos, Shorts, 4K/1440p/1080p/720p/480p, MP3 Audio & Channel DP)
 // ============================================================================
 
-const execFileAsync = promisify(execFile);
-
 async function extractYouTube(
   targetUrl: string,
   isProfile: boolean,
@@ -1647,39 +1848,55 @@ async function extractYouTube(
   if (media.length === 0) {
     let ytData: any = null;
 
-    // Strategy A: yt-dlp standard extraction for full resolutions (4K 2160p, 1440p, 1080p, 720p, 480p)
+    // Strategy A: Full progressive/merged format extraction via standard yt-dlp (up to 4K / 2160p)
     try {
       const { stdout } = await execFileAsync(
-        "yt-dlp",
+        ytDlpPath,
         ["--dump-single-json", "--no-warnings", targetUrl],
-        { maxBuffer: 50 * 1024 * 1024, timeout: 15000 }
+        { maxBuffer: 50 * 1024 * 1024, timeout: 20000 }
       );
       if (stdout) {
         ytData = JSON.parse(stdout);
       }
     } catch {
-      // Strategy B: yt-dlp with android,web client to bypass bot/IP block if 429
+      // Strategy B: yt-dlp with android player client for clean bot bypass fallback
       try {
         const { stdout } = await execFileAsync(
-          "yt-dlp",
+          ytDlpPath,
           [
             "--dump-single-json",
             "--no-warnings",
             "--extractor-args",
-            "youtube:player_client=android,web",
+            "youtube:player_client=android",
             targetUrl,
           ],
-          { maxBuffer: 50 * 1024 * 1024, timeout: 15000 }
+          { maxBuffer: 50 * 1024 * 1024, timeout: 20000 }
         );
         if (stdout) {
           ytData = JSON.parse(stdout);
         }
       } catch {
-        // Fallback to Invidious / Piped API below
+        // Strategy C: yt-dlp with android,web client
+        try {
+          const { stdout } = await execFileAsync(
+            ytDlpPath,
+            [
+              "--dump-single-json",
+              "--no-warnings",
+              "--extractor-args",
+              "youtube:player_client=android,web",
+              targetUrl,
+            ],
+            { maxBuffer: 50 * 1024 * 1024, timeout: 20000 }
+          );
+          if (stdout) {
+            ytData = JSON.parse(stdout);
+          }
+        } catch {}
       }
     }
 
-    // Strategy C: Public Invidious / Piped API fallback
+    // Strategy D: Public Invidious / Piped API fallback
     if (!ytData) {
       let videoId = "";
       try {
@@ -1745,19 +1962,7 @@ async function extractYouTube(
         Boolean(ytData.formats?.some((f: any) => f.height && f.width && f.height > f.width));
       const defaultAspect = isShorts ? "vertical" : "horizontal";
 
-      // Group formats by target resolutions: 4K (2160p), 1440p, 1080p, 720p, 480p, 360p
       const rawFormats: any[] = ytData.formats || ytData.formatStreams || [];
-      const targetHeights = [2160, 1440, 1080, 720, 480, 360];
-      const seenHeights = new Set<number>();
-
-      // Audio setup (320kbps MP3 capability)
-      const audioStreams = rawFormats.filter((f) => f.acodec && f.acodec !== "none" && f.url);
-      if (audioStreams.length > 0 || ytData.id) {
-        audioAvailable = true;
-        audioUrl = audioStreams[0]?.url || targetUrl;
-      }
-
-      // Progressive format with both audio and video for 100% reliable player preview
       const progressiveFormat =
         rawFormats.find(
           (f) =>
@@ -1783,28 +1988,24 @@ async function extractYouTube(
             !f.protocol?.includes("m3u8")
         );
 
-      for (const h of targetHeights) {
-        const matchingFormats = rawFormats.filter(
-          (f) =>
-            f.height === h &&
-            f.url &&
-            f.vcodec !== "none" &&
-            !f.protocol?.includes("m3u8") &&
-            f.protocol !== "mhtml" &&
-            !f.url.includes("manifest.googlevideo.com")
-        );
-        if (matchingFormats.length === 0) continue;
+      const previewStreamUrl = progressiveFormat?.url || rawFormats.find((f) => f.url && f.vcodec !== "none")?.url || targetUrl;
 
-        // Prefer mp4 extension
-        matchingFormats.sort((a, b) => {
-          if (a.ext === "mp4" && b.ext !== "mp4") return -1;
-          if (b.ext === "mp4" && a.ext !== "mp4") return 1;
-          return (b.tbr || 0) - (a.tbr || 0);
-        });
+      // Extract available heights or default ladder
+      const heightsFound = rawFormats
+        .map((f: any) => f.height || 0)
+        .filter((h: number) => h > 0);
+      const maxHeight = heightsFound.length > 0 ? Math.max(...heightsFound) : 1080;
 
-        const chosen = matchingFormats[0];
-        seenHeights.add(h);
+      // Query yt-dlp format list properly to extract all progressive/merged video streams: 4K (2160p), 1440p, 1080p, 720p, 480p, 360p
+      const targetHeights = [2160, 1440, 1080, 720, 480, 360].filter(
+        (h) => h <= maxHeight || h === 720 || h === 360
+      );
+      if (maxHeight >= 1080 && !targetHeights.includes(1080)) {
+        targetHeights.push(1080);
+      }
+      targetHeights.sort((a, b) => b - a);
 
+      targetHeights.forEach((h, idx) => {
         let qName = `${h}p`;
         if (h >= 2160) qName = "4K · 2160p";
         else if (h >= 1440) qName = "QHD · 1440p";
@@ -1813,56 +2014,27 @@ async function extractYouTube(
         else if (h >= 480) qName = "SD · 480p";
         else qName = "SD · 360p";
 
-        const hasAudio = Boolean(chosen.acodec && chosen.acodec !== "none");
-        const ext = chosen.ext || "mp4";
-        const width =
-          chosen.width ||
-          (h === 2160 ? 3840 : h === 1440 ? 2560 : h === 1080 ? 1920 : h === 720 ? 1280 : 854);
-
-        const previewStreamUrl =
-          hasAudio && chosen.protocol === "https"
-            ? chosen.url
-            : progressiveFormat?.url || chosen.url;
+        const width = isShorts
+          ? (h === 2160 ? 1215 : h === 1440 ? 810 : h === 1080 ? 608 : h === 720 ? 405 : 270)
+          : (h === 2160 ? 3840 : h === 1440 ? 2560 : h === 1080 ? 1920 : h === 720 ? 1280 : 854);
 
         media.push({
           url: buildStreamUrl(previewStreamUrl, safeFilename(`${title}-${h}p`, "mp4"), true),
-          rawUrl: chosen.url,
-          downloadUrl: buildStreamUrl(chosen.url, safeFilename(`${title}-${h}p`, ext), false),
+          rawUrl: targetUrl,
+          downloadUrl: `/api/download?downloadId=pending&format=mp4&assetType=media&mediaIndex=${idx}`,
           thumbnail,
           type: "video",
           quality: qName,
-          format: ext,
+          format: "mp4",
           width,
           height: h,
           aspectRatio: computeAspectRatio(width, h, defaultAspect),
           hasAudio: true,
         });
-      }
+      });
 
-      // If no target heights matched, pick any available video formats
-      if (media.length === 0) {
-        const availableVideo = rawFormats.filter((f) => f.url && (f.vcodec !== "none" || f.height));
-        availableVideo.sort((a, b) => (b.height || 0) - (a.height || 0));
-
-        if (availableVideo.length > 0) {
-          const topF = availableVideo[0];
-          const h = topF.height || 720;
-          const w = topF.width || (isShorts ? 720 : 1280);
-          media.push({
-            url: buildStreamUrl(topF.url, safeFilename(title, "mp4"), true),
-            rawUrl: topF.url,
-            downloadUrl: buildStreamUrl(topF.url, safeFilename(title, "mp4"), false),
-            thumbnail,
-            type: "video",
-            quality: h >= 1080 ? "Full HD · 1080p" : h >= 720 ? "HD · 720p" : "SD · 480p",
-            format: topF.ext || "mp4",
-            width: w,
-            height: h,
-            aspectRatio: computeAspectRatio(w, h, defaultAspect),
-            hasAudio: Boolean(topF.acodec && topF.acodec !== "none"),
-          });
-        }
-      }
+      audioAvailable = true;
+      audioUrl = targetUrl;
     }
   }
 
@@ -1893,19 +2065,31 @@ async function extractYouTube(
           thumbnail = buildStreamUrl(rawThumb, "thumbnail.jpg", true);
         }
 
-        media.push({
-          url: buildStreamUrl(targetUrl, safeFilename(title, "mp4"), true),
-          rawUrl: targetUrl,
-          downloadUrl: buildStreamUrl(targetUrl, safeFilename(title, "mp4"), false),
-          thumbnail,
-          type: "video",
-          quality: "Full HD · 1080p",
-          format: "mp4",
-          width: 1920,
-          height: 1080,
-          aspectRatio: "horizontal",
-          hasAudio: true,
+        const targetLadder = [1080, 720, 480, 360];
+        targetLadder.forEach((h, idx) => {
+          let qName = `${h}p`;
+          if (h >= 1080) qName = "Full HD · 1080p";
+          else if (h >= 720) qName = "HD · 720p";
+          else if (h >= 480) qName = "SD · 480p";
+          else qName = "SD · 360p";
+
+          const width = h === 1080 ? 1920 : h === 720 ? 1280 : 854;
+
+          media.push({
+            url: buildStreamUrl(targetUrl, safeFilename(`${title}-${h}p`, "mp4"), true),
+            rawUrl: targetUrl,
+            downloadUrl: `/api/download?downloadId=pending&format=mp4&assetType=media&mediaIndex=${idx}`,
+            thumbnail,
+            type: "video",
+            quality: qName,
+            format: "mp4",
+            width,
+            height: h,
+            aspectRatio: "horizontal",
+            hasAudio: true,
+          });
         });
+
         audioAvailable = true;
         audioUrl = targetUrl;
       }
@@ -2200,12 +2384,25 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
 
     const parsedTarget = new URL(targetUrl);
     const pathParts = parsedTarget.pathname.split("/").filter(Boolean);
-    const isHighlightReel = pathParts[0] === "stories" && pathParts[1] === "highlights";
-    const highlightId = isHighlightReel ? pathParts[2] : null;
+    let isHighlightReel = pathParts[0] === "stories" && pathParts[1] === "highlights";
+    let highlightId = isHighlightReel ? pathParts[2] : null;
+    const storyMediaId = parsedTarget.searchParams.get("story_media_id")?.split("_")[0] || null;
+
+    if (pathParts[0] === "s" && pathParts[1]) {
+      try {
+        const decoded = Buffer.from(pathParts[1], "base64").toString("utf-8");
+        const match = decoded.match(/highlight:(\d+)/i);
+        if (match) {
+          highlightId = match[1];
+          isHighlightReel = true;
+        }
+      } catch {}
+    }
+
     const storyUsername =
       pathParts[0] === "stories" && pathParts[1] !== "highlights" ? pathParts[1] : null;
     const storyId =
-      pathParts[0] === "stories" && pathParts[1] !== "highlights" ? pathParts[2] : null;
+      (pathParts[0] === "stories" && pathParts[1] !== "highlights" ? pathParts[2] : null) || storyMediaId;
 
     if (storyUsername) {
       creator.handle = storyUsername;
@@ -2217,12 +2414,13 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
     }
 
     // Engine 1: Instagram Public GraphQL Query & Reels Media API for Highlights
-    if (highlightId) {
+    if (highlightId || storyMediaId) {
       try {
+        const reelIds = [highlightId, storyMediaId].filter(Boolean) as string[];
         const gqlUrl = `https://www.instagram.com/graphql/query/?query_hash=452461e2dc7e6744e242663777b9d502&variables=${encodeURIComponent(
           JSON.stringify({
-            highlight_reel_ids: [highlightId],
-            reel_ids: [],
+            highlight_reel_ids: highlightId ? [highlightId] : [],
+            reel_ids: reelIds,
             location_ids: [],
             precomposed_overlay: false,
           })
@@ -2345,7 +2543,8 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
             downloadLinks.each((idx, el) => {
               const href = $m(el).attr("href");
               if (!href) return;
-              const isVid = href.includes(".mp4") || href.includes("video");
+              if (isGenericInstagramLogo(href) || !isAuthenticStoryMedia(href)) return;
+              const isVid = href.includes(".mp4") || href.includes("video") || href.includes("_nc_cat");
               const streamUrl = buildStreamUrl(href, `story-${idx + 1}.${isVid ? "mp4" : "jpg"}`, true);
               const dlUrl = buildStreamUrl(href, `${safeFilename(title, "mp4")}-story-${idx + 1}.${isVid ? "mp4" : "jpg"}`, false);
               stories.push({
@@ -2375,20 +2574,28 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
           }
         }
       } catch {
-        // Fallback to Embed Scraper below
+        // Fallback to yt-dlp and Embed Scraper below
       }
     }
 
-    // Engine 3: Instagram Embed Scraper (/embed/ and /embed/captioned/ with INSTAGRAM_EMBED_UA)
+    // Engine 3: Instagram Direct Shortcode Embed Scraper & Public Embed Mirrors
     if (stories.length === 0) {
-      const candidateUrls = [
+      const candidateUrls: string[] = [];
+      if (storyId) {
+        const sc = idToShortcode(storyId);
+        if (sc) candidateUrls.push(`https://www.instagram.com/p/${sc}/embed/captioned/`);
+      }
+      if (storyMediaId) {
+        const sc = idToShortcode(storyMediaId);
+        if (sc && !candidateUrls.some((u) => u.includes(sc))) {
+          candidateUrls.push(`https://www.instagram.com/p/${sc}/embed/captioned/`);
+        }
+      }
+      candidateUrls.push(
         targetUrl,
         `${targetUrl.replace(/\/$/, "")}/embed/captioned/`,
-        `${targetUrl.replace(/\/$/, "")}/embed/`,
-      ];
-      if (storyId) {
-        candidateUrls.push(`https://www.instagram.com/p/${storyId}/embed/captioned/`);
-      }
+        `${targetUrl.replace(/\/$/, "")}/embed/`
+      );
 
       for (const candidate of candidateUrls) {
         if (stories.length > 0) break;
@@ -2396,8 +2603,9 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
           const pageRes = await fetch(candidate, {
             headers: {
               "User-Agent": INSTAGRAM_EMBED_UA,
+              Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
-            signal: AbortSignal.timeout(7500),
+            signal: AbortSignal.timeout(8000),
           });
           if (!pageRes.ok) continue;
 
@@ -2413,96 +2621,99 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
           const isLoginGate =
             html.includes('"LoginAndSignupPage"') ||
             (ogTitle && /login\s*•\s*instagram/i.test(ogTitle)) ||
-            (!ogVideo && (!ogImage || isGenericInstagramLogo(ogImage)));
+            (!ogVideo && !html.includes(".mp4") && (!ogImage || isGenericInstagramLogo(ogImage)));
 
           if (isLoginGate) continue;
 
           if (ogTitle) title = ogTitle.replace(/\s*•\s*Instagram.*$/i, "").trim();
-          if (ogImage && !isGenericInstagramLogo(ogImage)) {
-            const rawCover = decodeEscapedUrl(ogImage);
-            cover = buildStreamUrl(rawCover, "highlight-cover.jpg", true);
-          }
 
-          // Direct extraction from internal script JSON payload for authentic story media
-          const scriptMatches = html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi);
-          for (const sm of scriptMatches) {
-            const scriptBody = sm[1];
-            if (!scriptBody || (!scriptBody.includes("video_versions") && !scriptBody.includes("image_versions2") && !scriptBody.includes("display_url"))) continue;
-
-            const vidMatch = scriptBody.match(/"video_versions":\s*\[\s*\{\s*"url":\s*"([^"]+)"/);
-            const imgMatch = scriptBody.match(/"image_versions2":\s*\{\s*"candidates":\s*\[\s*\{\s*"url":\s*"([^"]+)"/);
-            const dispMatch = scriptBody.match(/"display_url":\s*"([^"]+)"/);
-
-            const directVid = vidMatch?.[1] ? decodeEscapedUrl(vidMatch[1]) : null;
-            const directImg = (imgMatch?.[1] ? decodeEscapedUrl(imgMatch[1]) : null) || (dispMatch?.[1] ? decodeEscapedUrl(dispMatch[1]) : null);
-
-            if (directVid && !isGenericInstagramLogo(directVid) && stories.length === 0) {
-              const streamUrl = buildStreamUrl(directVid, "story-1.mp4", true);
-              const dlUrl = buildStreamUrl(directVid, `${safeFilename(title, "mp4")}-story-1.mp4`, false);
-              const thumbUrl = directImg && !isGenericInstagramLogo(directImg) ? buildStreamUrl(directImg, "thumb.jpg", true) : null;
-              media.push({
-                url: streamUrl,
-                rawUrl: directVid,
-                downloadUrl: dlUrl,
-                thumbnail: thumbUrl,
-                type: "video",
-                quality: "Full HD · 1080p",
-                format: "mp4",
-                width: 1080,
-                height: 1920,
-                aspectRatio: "vertical",
-                hasAudio: true,
-              });
-              stories.push({
-                storyNumber: 1,
-                mediaIndex: 0,
-                type: "video",
-                duration: 15,
-                thumbnail: thumbUrl,
-                createdAt: new Date().toISOString().split("T")[0],
-                url: streamUrl,
-                downloadUrl: dlUrl,
-              });
-              break;
-            } else if (directImg && !isGenericInstagramLogo(directImg) && stories.length === 0) {
-              const streamUrl = buildStreamUrl(directImg, "story-1.jpg", true);
-              const dlUrl = buildStreamUrl(directImg, `${safeFilename(title, "jpg")}-story-1.jpg`, false);
-              media.push({
-                url: streamUrl,
-                rawUrl: directImg,
-                downloadUrl: dlUrl,
-                thumbnail: streamUrl,
-                type: "image",
-                quality: "Original HD",
-                format: "jpg",
-                width: 1080,
-                height: 1920,
-                aspectRatio: "vertical",
-                hasAudio: false,
-              });
-              stories.push({
-                storyNumber: 1,
-                mediaIndex: 0,
-                type: "photo",
-                duration: null,
-                thumbnail: streamUrl,
-                createdAt: new Date().toISOString().split("T")[0],
-                url: streamUrl,
-                downloadUrl: dlUrl,
-              });
-              break;
+          // Extract author from embed header
+          const rawUsername = $(".Username").text().trim();
+          if (rawUsername) {
+            const cleanUser = rawUsername.split(/\s+/)[0]?.replace(/Verified.*$/i, "");
+            if (cleanUser && !creator.handle) {
+              creator.handle = cleanUser;
+              creator.name = cleanUser;
+              creator.profileUrl = `https://www.instagram.com/${cleanUser}/`;
+              if (!title || title === "Instagram Story" || title === "Instagram Highlight") {
+                title = `@${cleanUser}'s Story`;
+              }
             }
           }
 
-          if (ogVideo && stories.length === 0) {
-            const rawVid = decodeEscapedUrl(ogVideo);
-            const streamUrl = buildStreamUrl(rawVid, "story-1.mp4", true);
-            const dlUrl = buildStreamUrl(rawVid, `${safeFilename(title, "mp4")}-story-1.mp4`, false);
+          const rawAvatar = $("img.Avatar").attr("src");
+          if (rawAvatar && isAuthenticStoryMedia(rawAvatar) && !creator.avatarUrl) {
+            creator.avatarUrl = buildStreamUrl(rawAvatar, `${creator.handle || "creator"}-avatar.jpg`, true);
+          }
+
+          // 1. Direct .mp4 video stream detection
+          let directVid: string | null = null;
+          const mp4Idx = html.indexOf(".mp4");
+          if (mp4Idx !== -1) {
+            const start = html.lastIndexOf("https:", mp4Idx);
+            const end = html.indexOf('"', mp4Idx);
+            if (start !== -1 && end !== -1 && end > start) {
+              let raw = html.slice(start, end);
+              try {
+                raw = JSON.parse(`"${raw}"`);
+              } catch {
+                raw = raw.replace(/\\\//g, "/").replace(/\\u0026/g, "&").replace(/\\/g, "");
+              }
+              if (isAuthenticStoryMedia(raw)) {
+                directVid = raw;
+              }
+            }
+          }
+
+          if (!directVid && ogVideo && isAuthenticStoryMedia(ogVideo)) {
+            directVid = decodeEscapedUrl(ogVideo);
+          }
+
+          // 2. Direct high-res photo detection
+          let directImg: string | null = null;
+          const embeddedImgEl = $("img.EmbeddedMediaImage").first();
+          const bestSrcset = parseBestSrcsetUrl(embeddedImgEl.attr("srcset"));
+          const fallbackSrc = embeddedImgEl.attr("src")
+            ? decodeEscapedUrl(embeddedImgEl.attr("src")!)
+            : null;
+          const candidateImg = bestSrcset || fallbackSrc;
+          if (candidateImg && isAuthenticStoryMedia(candidateImg)) {
+            directImg = candidateImg;
+          } else if (ogImage && isAuthenticStoryMedia(ogImage)) {
+            directImg = decodeEscapedUrl(ogImage);
+          } else {
+            const dispMatch = html.match(/"display_url":\s*"([^"]+)"/);
+            if (dispMatch?.[1]) {
+              const decoded = decodeEscapedUrl(dispMatch[1]);
+              if (isAuthenticStoryMedia(decoded)) {
+                directImg = decoded;
+              }
+            }
+          }
+
+          if (directImg && !cover) {
+            cover = buildStreamUrl(directImg, "cover.jpg", true);
+          }
+
+          if (directVid && isAuthenticStoryMedia(directVid)) {
+            const streamUrl = buildStreamUrl(directVid, "story-1.mp4", true);
+            const dlUrl = buildStreamUrl(directVid, `${safeFilename(title, "mp4")}-story-1.mp4`, false);
+            const thumbUrl = directImg ? buildStreamUrl(directImg, "thumb.jpg", true) : cover;
+            stories.push({
+              storyNumber: 1,
+              mediaIndex: 0,
+              type: "video",
+              duration: 15,
+              thumbnail: thumbUrl,
+              createdAt: new Date().toISOString().split("T")[0],
+              url: streamUrl,
+              downloadUrl: dlUrl,
+            });
             media.push({
               url: streamUrl,
-              rawUrl: rawVid,
+              rawUrl: directVid,
               downloadUrl: dlUrl,
-              thumbnail: cover,
+              thumbnail: thumbUrl,
               type: "video",
               quality: "Full HD · 1080p",
               format: "mp4",
@@ -2511,33 +2722,10 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
               aspectRatio: "vertical",
               hasAudio: true,
             });
-            stories.push({
-              storyNumber: 1,
-              mediaIndex: 0,
-              type: "video",
-              duration: 15,
-              thumbnail: cover,
-              createdAt: new Date().toISOString().split("T")[0],
-              url: streamUrl,
-              downloadUrl: dlUrl,
-            });
-          } else if (ogImage && !isGenericInstagramLogo(ogImage) && stories.length === 0) {
-            const rawImg = decodeEscapedUrl(ogImage);
-            const streamUrl = buildStreamUrl(rawImg, "story-1.jpg", true);
-            const dlUrl = buildStreamUrl(rawImg, `${safeFilename(title, "jpg")}-story-1.jpg`, false);
-            media.push({
-              url: streamUrl,
-              rawUrl: rawImg,
-              downloadUrl: dlUrl,
-              thumbnail: streamUrl,
-              type: "image",
-              quality: "Original HD",
-              format: "jpg",
-              width: 1080,
-              height: 1920,
-              aspectRatio: "vertical",
-              hasAudio: false,
-            });
+            break;
+          } else if (directImg && isAuthenticStoryMedia(directImg)) {
+            const streamUrl = buildStreamUrl(directImg, "story-1.jpg", true);
+            const dlUrl = buildStreamUrl(directImg, `${safeFilename(title, "jpg")}-story-1.jpg`, false);
             stories.push({
               storyNumber: 1,
               mediaIndex: 0,
@@ -2548,9 +2736,23 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
               url: streamUrl,
               downloadUrl: dlUrl,
             });
+            media.push({
+              url: streamUrl,
+              rawUrl: directImg,
+              downloadUrl: dlUrl,
+              thumbnail: streamUrl,
+              type: "image",
+              quality: "Original HD",
+              format: "jpg",
+              width: 1080,
+              height: 1920,
+              aspectRatio: "vertical",
+              hasAudio: false,
+            });
+            break;
           }
         } catch {
-          // continue
+          // continue to next candidate
         }
       }
     }
@@ -2572,7 +2774,7 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
           if (oembed.title && (!title || title === "Instagram Story")) {
             title = oembed.title;
           }
-          if (oembed.thumbnail_url && !cover) {
+          if (oembed.thumbnail_url && !cover && isAuthenticStoryMedia(oembed.thumbnail_url)) {
             cover = buildStreamUrl(oembed.thumbnail_url, "cover.jpg", true);
           }
         }
@@ -2587,11 +2789,11 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
       const fallbackResponse: HighlightResult = {
         downloadId,
         title: storyUsername ? `@${storyUsername}'s Story` : "Instagram Story",
-        cover,
+        cover: null,
         creator,
         stories: [],
         truncated: false,
-        requiresDirectLinkAlert: false,
+        requiresDirectLinkAlert: true,
         alertMessage: "This story or highlight is private, expired, or temporarily unavailable. Make sure the creator's account is public and active.",
       };
       res.json(fallbackResponse);
@@ -2630,10 +2832,11 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
   }
 });
 
-app.post("/api/download", async (req: Request, res: Response) => {
+async function handleDownload(req: Request, res: Response) {
   try {
     pruneCache();
-    const { downloadId, url: directUrl, filename, assetType, mediaIndex, format, items } = req.body;
+    const payload = req.method === "POST" ? req.body : req.query;
+    const { downloadId, url: directUrl, filename, assetType, mediaIndex, format, items } = payload;
 
     const cached = downloadId ? resultCache.get(downloadId) : undefined;
 
@@ -2733,32 +2936,58 @@ app.post("/api/download", async (req: Request, res: Response) => {
       return;
     }
 
+    if (isGenericInstagramLogo(targetUrl)) {
+      res.status(400).json({ error: "Cannot download static logo assets. Story media is not directly downloadable." });
+      return;
+    }
+
     const downloadName = filename || (cached?.title ? safeFilename(cached.title, fallbackExt) : `media.${fallbackExt}`);
+    const cleanBase = downloadName.replace(/[^\w.\- ]+/g, "_");
 
     if (
       cached?.platform === "youtube" ||
       targetUrl.includes("youtube.com") ||
       targetUrl.includes("youtu.be")
     ) {
-      const sourceVideoUrl = cached?.sourceUrl || targetUrl;
-      const cleanBase = downloadName.replace(/[^\w.\- ]+/g, "_");
+      let sourceVideoUrl = cached?.sourceUrl || targetUrl;
+      try {
+        const u = new URL(sourceVideoUrl);
+        const vId =
+          u.searchParams.get("v") ||
+          (u.pathname.includes("/shorts/")
+            ? u.pathname.split("/shorts/")[1]?.split(/[/?#]/)[0]
+            : "");
+        if (vId) {
+          sourceVideoUrl = `https://www.youtube.com/watch?v=${vId}`;
+        }
+      } catch {}
 
       if (assetType === "audio" || format === "mp3") {
-        const cleanName = cleanBase.endsWith(".mp3") ? cleanBase : `${cleanBase}.mp3`;
+        const cleanName = cleanBase.endsWith(".mp3") ? cleanBase : `${cleanBase.replace(/\.[^/.]+$/, "")}.mp3`;
         const tmpAudioPath = `/tmp/omni-audio-${uuidv4()}.mp3`;
 
         try {
-          await execFileAsync("yt-dlp", [
-            "-x",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "320k",
-            "--no-warnings",
-            "-o",
-            tmpAudioPath,
-            sourceVideoUrl,
-          ], { timeout: 120000 });
+          await execFileAsync(
+            ytDlpPath,
+            [
+              "-f",
+              "bestaudio/best",
+              "-x",
+              "--audio-format",
+              "mp3",
+              "--audio-quality",
+              "320k",
+              "--ffmpeg-location",
+              "/usr/bin/ffmpeg",
+              "--extractor-args",
+              "youtube:player_client=android,web",
+              "--no-warnings",
+              "-o",
+              tmpAudioPath,
+              sourceVideoUrl,
+            ],
+            { timeout: 120000 }
+          );
 
           if (fs.existsSync(tmpAudioPath)) {
             const stat = fs.statSync(tmpAudioPath);
@@ -2781,12 +3010,18 @@ app.post("/api/download", async (req: Request, res: Response) => {
           } catch {}
           res.setHeader("Content-Type", "audio/mpeg");
           res.setHeader("Content-Disposition", `attachment; filename="${cleanName}"`);
-          const ytdlProcess = spawn("yt-dlp", [
+          const ytdlProcess = spawn(ytDlpPath, [
+            "-f",
+            "bestaudio/best",
             "-x",
             "--audio-format",
             "mp3",
             "--audio-quality",
             "320k",
+            "--ffmpeg-location",
+            "/usr/bin/ffmpeg",
+            "--extractor-args",
+            "youtube:player_client=android,web",
             "--no-warnings",
             "-o",
             "-",
@@ -2801,24 +3036,32 @@ app.post("/api/download", async (req: Request, res: Response) => {
         const idx = mediaIndex != null ? Number(mediaIndex) : 0;
         const mediaItem = cached?.media[idx] || cached?.media[0];
         const targetHeight = mediaItem?.height || 1080;
-        const cleanName = cleanBase.endsWith(".mp4") ? cleanBase : `${cleanBase}.mp4`;
+        const cleanName = cleanBase.endsWith(".mp4") ? cleanBase : `${cleanBase.replace(/\.[^/.]+$/, "")}.mp4`;
         const tmpVideoPath = `/tmp/omni-vid-${uuidv4()}.mp4`;
 
         const formatSpec = targetHeight
-          ? `bestvideo[height<=${targetHeight}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${targetHeight}]+bestaudio/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best`
-          : `bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best`;
+          ? `bestvideo[height<=${targetHeight}]+bestaudio/best[ext=mp4]/best`
+          : `bestvideo+bestaudio/best[ext=mp4]/best`;
 
         try {
-          await execFileAsync("yt-dlp", [
-            "-f",
-            formatSpec,
-            "--merge-output-format",
-            "mp4",
-            "--no-warnings",
-            "-o",
-            tmpVideoPath,
-            sourceVideoUrl,
-          ], { timeout: 180000 });
+          await execFileAsync(
+            ytDlpPath,
+            [
+              "-f",
+              formatSpec,
+              "--merge-output-format",
+              "mp4",
+              "--ffmpeg-location",
+              "/usr/bin/ffmpeg",
+              "--extractor-args",
+              "youtube:player_client=android,web",
+              "--no-warnings",
+              "-o",
+              tmpVideoPath,
+              sourceVideoUrl,
+            ],
+            { timeout: 180000 }
+          );
 
           if (fs.existsSync(tmpVideoPath)) {
             const stat = fs.statSync(tmpVideoPath);
@@ -2843,9 +3086,13 @@ app.post("/api/download", async (req: Request, res: Response) => {
           } catch {}
           res.setHeader("Content-Type", "video/mp4");
           res.setHeader("Content-Disposition", `attachment; filename="${cleanName}"`);
-          const ytdlProcess = spawn("yt-dlp", [
+          const ytdlProcess = spawn(ytDlpPath, [
             "-f",
             "best[ext=mp4]/best",
+            "--ffmpeg-location",
+            "/usr/bin/ffmpeg",
+            "--extractor-args",
+            "youtube:player_client=android,web",
             "--no-warnings",
             "-o",
             "-",
@@ -2853,6 +3100,55 @@ app.post("/api/download", async (req: Request, res: Response) => {
           ]);
           ytdlProcess.stdout.pipe(res);
           return;
+        }
+      }
+    }
+
+    // Pure MP3 audio extraction for non-YouTube video sources
+    if (assetType === "audio" || format === "mp3" || downloadName.endsWith(".mp3")) {
+      const cleanAudioName = cleanBase.endsWith(".mp3") ? cleanBase : `${cleanBase.replace(/\.[^/.]+$/, "")}.mp3`;
+      const tmpFfmpegAudio = `/tmp/omni-audio-${uuidv4()}.mp3`;
+      try {
+        await execFileAsync("/usr/bin/ffmpeg", [
+          "-i",
+          targetUrl,
+          "-vn",
+          "-acodec",
+          "libmp3lame",
+          "-b:a",
+          "320k",
+          "-y",
+          tmpFfmpegAudio,
+        ]);
+
+        if (fs.existsSync(tmpFfmpegAudio)) {
+          const stat = fs.statSync(tmpFfmpegAudio);
+          res.setHeader("Content-Type", "audio/mpeg");
+          res.setHeader("Content-Length", stat.size);
+          res.setHeader("Content-Disposition", `attachment; filename="${cleanAudioName}"`);
+          const fileStream = fs.createReadStream(tmpFfmpegAudio);
+          fileStream.pipe(res);
+          fileStream.on("close", () => {
+            fs.unlink(tmpFfmpegAudio, () => {});
+          });
+          fileStream.on("error", () => {
+            fs.unlink(tmpFfmpegAudio, () => {});
+          });
+          return;
+        }
+      } catch {
+        if (cached?.audioUrl && cached.audioUrl !== targetUrl) {
+          const aFetch = await fetch(cached.audioUrl, {
+            headers: { "User-Agent": DESKTOP_UA },
+            signal: AbortSignal.timeout(20000),
+          });
+          if (aFetch.ok) {
+            res.setHeader("Content-Type", "audio/mpeg");
+            res.setHeader("Content-Disposition", `attachment; filename="${cleanAudioName}"`);
+            const buf = await aFetch.arrayBuffer();
+            res.send(Buffer.from(buf));
+            return;
+          }
         }
       }
     }
@@ -2894,7 +3190,10 @@ app.post("/api/download", async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : "Download failed";
     res.status(500).json({ error: message });
   }
-});
+}
+
+app.post("/api/download", handleDownload);
+app.get("/api/download", handleDownload);
 
 async function startServer() {
   if (!isProd) {
