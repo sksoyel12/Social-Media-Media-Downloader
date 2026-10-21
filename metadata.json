@@ -1,0 +1,8 @@
+{
+  "name": "OmniDownloader",
+  "description": "Preview and save media from public Instagram, TikTok, YouTube, and Pinterest posts you are authorized to keep.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
