@@ -7,6 +7,7 @@ import { Readable } from "stream";
 import { promisify } from "util";
 import { v4 as uuidv4 } from "uuid";
 import * as cheerio from "cheerio";
+// @ts-ignore
 import archiver from "archiver";
 import type {
   DownloadCreator,
@@ -17,7 +18,7 @@ import type {
   Platform,
 } from "./src/types/api";
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = 3000;
 const isProd = process.env.NODE_ENV === "production";
 
 const binDir = path.resolve(process.cwd(), "bin");
@@ -163,12 +164,23 @@ function idToShortcode(idStr: string | null | undefined): string {
 function isGenericInstagramLogo(url: string | null | undefined): boolean {
   if (!url) return true;
   const lower = url.toLowerCase();
+  // Legitimate user media uploaded to Instagram's CDN should never be marked as generic logo
+  if (
+    lower.includes("/v/t51.") ||
+    lower.includes("/v/t50.") ||
+    lower.includes("/t51.") ||
+    lower.includes("/t50.") ||
+    lower.includes("/o1/v/") ||
+    lower.includes("/e35/") ||
+    lower.includes("/p1080x1080/") ||
+    lower.includes("/p750x750/")
+  ) {
+    return false;
+  }
   return (
     lower.includes("instagram_logo") ||
     lower.includes("instagram-logo") ||
     lower.includes("instagramlogo") ||
-    lower.includes("instagram_icon") ||
-    lower.includes("instagram-icon") ||
     lower.includes("brand_assets") ||
     lower.includes("brand-assets") ||
     lower.includes("brandassets") ||
@@ -178,20 +190,12 @@ function isGenericInstagramLogo(url: string | null | undefined): boolean {
     lower.includes("/static/images/") ||
     lower.includes("/static/rsrc/") ||
     lower.includes("favicon") ||
-    lower.includes("ig_icon") ||
     lower.includes("apple-touch-icon") ||
-    lower.includes("play-button") ||
     lower.includes("transparent.png") ||
     lower.includes("spacer.gif") ||
-    lower.includes("sprite") ||
-    lower.includes("glyph") ||
     lower.includes("meta_logo") ||
-    lower.includes("instagram-app") ||
     lower.includes("fbcdn.net/rsrc.php") ||
-    lower.includes("150x150") ||
-    lower.includes("100x100") ||
-    /logo.*\.(?:png|jpg|jpeg|svg|webp)/i.test(lower) ||
-    /instagram[_-]?(?:glyph|brand|icon|wordmark|logo)/i.test(lower)
+    /instagram[_-]?(?:glyph|brand|wordmark|logo)\.(?:png|jpg|svg|webp)/i.test(lower)
   );
 }
 
@@ -341,6 +345,15 @@ async function resolveShortUrl(rawUrl: string): Promise<string> {
   let current = decodeInstagramShareHighlight(rawUrl.trim());
   const cookies: string[] = [];
 
+  try {
+    const first = new URL(current);
+    if (isTikTokShortlink(first)) {
+      return sanitizeTrackingParams(await unshortenTikTok(current));
+    }
+  } catch {
+    // not a parseable URL; fall through to the generic resolver
+  }
+
   for (let hop = 0; hop < 8; hop++) {
     try {
       const parsed = new URL(current);
@@ -449,6 +462,898 @@ async function resolveShortUrl(rawUrl: string): Promise<string> {
   }
 
   return sanitizeTrackingParams(current);
+}
+
+// ============================================================================
+// TIKTOK: SHORTLINK UNSHORTENER + TIKWM PUBLIC API MIRROR
+// ============================================================================
+
+/** Mobile UA used for every TikTok shortlink hop (vt./vm./ /t/ links). */
+const TIKTOK_SHORTLINK_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X)";
+const TIKWM_BASE = (process.env.TIKWM_BASE || "https://www.tikwm.com").replace(/\/+$/, "");
+const TIKTOK_CONTENT_PATH = /^\/@[^/]+\/(?:video|photo|story)\/\d+/i;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function isTikTokShortlink(u: URL): boolean {
+  const host = u.hostname.toLowerCase();
+  return (
+    host === "vt.tiktok.com" ||
+    host === "vm.tiktok.com" ||
+    (host.endsWith("tiktok.com") && /^\/t\//.test(u.pathname))
+  );
+}
+
+/**
+ * Fully unshortens a TikTok shortlink (vt.tiktok.com/ZS..., vm.tiktok.com/..., tiktok.com/t/...)
+ * by following the redirect chain by hand with a mobile User-Agent, and returns the canonical
+ * https://www.tiktok.com/@user/(video|photo|story)/<id> URL. If the chain ends in a geo / consent /
+ * login trap (/about, /login, "/") the last useful URL is returned instead of the trap.
+ */
+async function unshortenTikTok(rawUrl: string): Promise<string> {
+  let current = rawUrl.trim();
+  let best = current;
+
+  for (let hop = 0; hop < 8; hop++) {
+    let parsed: URL;
+    try {
+      parsed = new URL(current);
+    } catch {
+      break;
+    }
+    if (TIKTOK_CONTENT_PATH.test(parsed.pathname)) {
+      best = current;
+      break;
+    }
+    if (!parsed.hostname.toLowerCase().endsWith("tiktok.com")) break;
+
+    try {
+      const res = await fetch(current, {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          "User-Agent": TIKTOK_SHORTLINK_UA,
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+
+      const location = res.headers.get("location");
+      if (location && [301, 302, 303, 307, 308].includes(res.status)) {
+        await res.body?.cancel().catch(() => {});
+        const next = new URL(location, current);
+        if (/\/(?:about|login)(?:\/|$)/i.test(next.pathname) || next.pathname === "/") break;
+        current = next.toString();
+        best = current;
+        continue;
+      }
+
+      if (res.status === 200) {
+        const html = await res.text();
+        const found =
+          html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i)?.[1] ||
+          html.match(/<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
+          html.match(/https?:\/\/(?:www\.|m\.)?tiktok\.com\/@[^"'\s<>\\]+\/(?:video|photo|story)\/\d+/i)?.[0];
+        if (found) best = found.replace(/&amp;/g, "&");
+      } else {
+        await res.body?.cancel().catch(() => {});
+      }
+      break;
+    } catch {
+      break;
+    }
+  }
+
+  try {
+    const u = new URL(best);
+    if (TIKTOK_CONTENT_PATH.test(u.pathname)) {
+      u.search = "";
+      u.hash = "";
+      return u.toString();
+    }
+  } catch {
+    // fall through
+  }
+  return best;
+}
+
+function absoluteTikWmUrl(u: unknown): string | null {
+  if (typeof u !== "string" || !u) return null;
+  if (/^https?:\/\//i.test(u)) return u;
+  if (u.startsWith("//")) return `https:${u}`;
+  return `${TIKWM_BASE}${u.startsWith("/") ? "" : "/"}${u}`;
+}
+
+function tikWmHasMedia(d: any): boolean {
+  return Boolean(d && (d.play || d.hdplay || (Array.isArray(d.images) && d.images.length > 0)));
+}
+
+/**
+ * GET https://www.tikwm.com/api/?url={url}  (POST form fallback). TikWM's free tier allows
+ * ~1 request/second, so one rate-limited response is retried after a short pause.
+ */
+async function callTikWm(videoUrl: string): Promise<any | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let rateLimited = false;
+
+    try {
+      const res = await fetch(`${TIKWM_BASE}/api/?url=${encodeURIComponent(videoUrl)}&hd=1`, {
+        headers: {
+          "User-Agent": TIKTOK_SHORTLINK_UA,
+          Accept: "application/json, text/javascript, */*; q=0.01",
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (res.ok) {
+        const json: any = await res.json();
+        if (tikWmHasMedia(json?.data)) return json.data;
+        if (/limit/i.test(String(json?.msg || ""))) rateLimited = true;
+      }
+    } catch {
+      // try POST below
+    }
+
+    try {
+      const form = new URLSearchParams({ url: videoUrl, hd: "1" });
+      const res = await fetch(`${TIKWM_BASE}/api/`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "User-Agent": DESKTOP_UA,
+          Accept: "application/json, text/javascript, */*; q=0.01",
+          Origin: TIKWM_BASE,
+          Referer: `${TIKWM_BASE}/`,
+        },
+        body: form.toString(),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (res.ok) {
+        const json: any = await res.json();
+        if (tikWmHasMedia(json?.data)) return json.data;
+        if (/limit/i.test(String(json?.msg || ""))) rateLimited = true;
+      }
+    } catch {
+      // ignore
+    }
+
+    if (!rateLimited) break;
+    await sleep(1300);
+  }
+  return null;
+}
+
+/**
+ * Dedicated TikTok post / Story / slideshow extractor built on TikWM.
+ *  - data.images present  -> mediaType "slideshow" (one image item per slide; audio exposed separately)
+ *  - else data.play       -> mediaType "video"     (watermark-free MP4, plus HD when different)
+ */
+async function extractTikTokViaTikWm(
+  canonicalUrl: string,
+  originalUrl: string
+): Promise<(PlatformExtractResult & { mediaType: "video" | "slideshow" }) | null> {
+  const storyToVid1 = canonicalUrl.replace(/\/story\//i, "/video/");
+  const storyToVid2 = originalUrl.replace(/\/story\//i, "/video/");
+  const storyIdMatch =
+    canonicalUrl.match(/\/story\/(\d+)/i) ||
+    originalUrl.match(/\/story\/(\d+)/i) ||
+    canonicalUrl.match(/\/video\/(\d+)/i) ||
+    originalUrl.match(/\/video\/(\d+)/i);
+  const candidates = Array.from(
+    new Set(
+      [
+        canonicalUrl,
+        storyToVid1,
+        storyToVid2,
+        originalUrl,
+        storyIdMatch?.[1] ? `https://www.tiktok.com/@tiktok/video/${storyIdMatch[1]}` : "",
+        storyIdMatch?.[1] || "",
+      ].filter(Boolean)
+    )
+  );
+  let d: any = null;
+  for (const candidate of candidates) {
+    d = await callTikWm(candidate);
+    if (d) break;
+  }
+  if (!d) return null;
+
+  const isStory =
+    /\/story\//i.test(canonicalUrl) ||
+    /\/story\//i.test(originalUrl) ||
+    Boolean(d.is_story);
+  const images: string[] = Array.isArray(d.images) ? d.images.filter(Boolean) : [];
+  const isSlideshow = images.length > 0;
+  const title: string = d.title || (isStory ? "TikTok Story" : isSlideshow ? "TikTok Slideshow" : "TikTok Post");
+
+  const creator: DownloadCreator = {
+    handle: d.author?.unique_id || null,
+    name: d.author?.nickname || d.author?.unique_id || null,
+    avatarUrl: null,
+    profileUrl: d.author?.unique_id ? `https://www.tiktok.com/@${d.author.unique_id}` : null,
+    verified: false,
+  };
+  const rawAvatar = absoluteTikWmUrl(d.author?.avatar);
+  if (rawAvatar) creator.avatarUrl = buildStreamUrl(rawAvatar, `${creator.handle || "creator"}-avatar.jpg`, true);
+
+  const rawCover = absoluteTikWmUrl(d.origin_cover || d.cover);
+  let thumbnail: string | null = rawCover ? buildStreamUrl(rawCover, "thumbnail.jpg", true) : null;
+
+  const rawMusic = absoluteTikWmUrl(typeof d.music === "string" ? d.music : d.music_info?.play);
+  const media: DownloadMedia[] = [];
+
+  if (isSlideshow) {
+    images.forEach((img, idx) => {
+      const full = absoluteTikWmUrl(img);
+      if (!full) return;
+      const preview = buildStreamUrl(full, `slide-${idx + 1}.jpg`, true);
+      media.push({
+        url: preview,
+        rawUrl: full,
+        downloadUrl: buildStreamUrl(full, safeFilename(`${title}-slide-${idx + 1}`, "jpg"), false),
+        thumbnail: preview,
+        type: "image",
+        quality: `Slide ${idx + 1} · Full HD`,
+        format: "jpg",
+        width: 1080,
+        height: 1440,
+        aspectRatio: "vertical",
+        hasAudio: false,
+      });
+    });
+  } else {
+    const sd = absoluteTikWmUrl(d.play);
+    const hd = absoluteTikWmUrl(d.hdplay);
+    const width = Number(d.width) || 1080;
+    const height = Number(d.height) || 1920;
+    const aspectRatio = computeAspectRatio(width, height, "vertical");
+    const push = (raw: string, quality: string, suffix: string) =>
+      media.push({
+        url: buildStreamUrl(raw, safeFilename(title, "mp4"), true),
+        rawUrl: raw,
+        downloadUrl: buildStreamUrl(raw, safeFilename(`${title}-${suffix}`, "mp4"), false),
+        thumbnail,
+        type: "video",
+        quality,
+        format: "mp4",
+        width,
+        height,
+        aspectRatio,
+        hasAudio: true,
+      });
+    if (sd) {
+      push(sd, isStory ? "Clean Story Video (Watermark-Free) · 1080p" : "Clean Video (Watermark-Free) · 1080p", "watermark-free");
+    }
+    if (hd && hd !== sd) push(hd, "Full HD · 1080p", "hd-1080p");
+  }
+
+  if (!media.length) return null;
+  if (!thumbnail) thumbnail = media[0].thumbnail || media[0].url;
+
+  return {
+    title,
+    caption: d.title || "",
+    thumbnail,
+    uploadDate: d.create_time ? new Date(Number(d.create_time) * 1000).toISOString().split("T")[0] : null,
+    audioUrl: rawMusic,
+    audioAvailable: Boolean(rawMusic) || !isSlideshow,
+    isCarousel: isSlideshow && media.length > 1,
+    creator,
+    media,
+    mediaType: isSlideshow ? "slideshow" : "video",
+  };
+}
+
+// ============================================================================
+// INSTAGRAM STORIES & HIGHLIGHTS: multi-stage public pipeline (never scrapes the login-gated HTML)
+//   Stage 1  anonymous GraphQL / reels_media + public /embed/ pages
+//   Stage 2  public story-downloader mirrors (POST the story/highlight URL, parse the media list)
+// ============================================================================
+
+const IG_APP_ID = "936619743392459";
+const IG_GRAPHQL_HASHES = (
+  process.env.IG_GRAPHQL_HASHES ||
+  "452461e2dc7e6744e242663777b9d502,c9155116936e523553ea52a0d5415202,07212581b4d2482e54c1ff0302b86f01,d52c9d88452200c412f6e1304ce38612"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+interface StoryTarget {
+  kind: "highlight" | "story";
+  highlightId: string | null;
+  username: string | null;
+  storyId: string | null;
+  storyMediaId: string | null;
+  userId: string | null;
+  canonicalUrl: string;
+}
+
+interface StoryItem {
+  type: "video" | "photo";
+  url: string;
+  thumbnail: string | null;
+  duration: number | null;
+  takenAt: string | null;
+}
+
+interface StoryFetch {
+  engine: string;
+  items: StoryItem[];
+  title?: string;
+  cover?: string | null;
+  creator?: Partial<DownloadCreator>;
+}
+
+/**
+ * Parses /stories/<user>/<id>/, /stories/highlights/<id>/ and Base64 mobile-share links
+ * (/s/aGlnaGxpZ2h0OjE4MTQ0... -> "highlight:18144533410375920").
+ */
+function parseStoryTarget(rawUrl: string): StoryTarget | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(decodeInstagramShareHighlight(rawUrl));
+  } catch {
+    return null;
+  }
+  const parts = parsed.pathname.split("/").filter(Boolean);
+  const rawSm = parsed.searchParams.get("story_media_id"); // "<mediaId>_<userId>"
+  const [smMedia, smUser] = rawSm ? rawSm.split("_") : [null, null];
+
+  if (parts[0] === "stories" && parts[1] === "highlights" && /^\d+$/.test(parts[2] || "")) {
+    return {
+      kind: "highlight",
+      highlightId: parts[2],
+      username: null,
+      storyId: null,
+      storyMediaId: smMedia || null,
+      userId: smUser || null,
+      canonicalUrl: `https://www.instagram.com/stories/highlights/${parts[2]}/`,
+    };
+  }
+  if (parts[0] === "stories" && parts[1] && parts[1] !== "highlights") {
+    const storyId = /^\d+$/.test(parts[2] || "") ? parts[2] : smMedia || null;
+    return {
+      kind: "story",
+      highlightId: null,
+      username: parts[1],
+      storyId,
+      storyMediaId: smMedia || null,
+      userId: smUser || null,
+      canonicalUrl: `https://www.instagram.com/stories/${parts[1]}/${storyId ? `${storyId}/` : ""}`,
+    };
+  }
+  return null;
+}
+
+/** Placeholder / chrome graphics that must never be presented as story media. */
+function isPlaceholderAsset(url: string | null | undefined): boolean {
+  if (!url) return true;
+  if (!/^https?:\/\//i.test(url)) return true;
+  const lower = url.toLowerCase();
+  return (
+    isGenericInstagramLogo(url) ||
+    /\.(?:svg|ico|gif)(?:[?#]|$)/.test(lower) ||
+    /(?:instagram[_-]?logo|brand[_-]?assets|favicon|apple-touch-icon|\/static\/|\/assets\/(?:img|images|icons?)\/|\/(?:logo|icons?)\/|sprite|placeholder|loading\.)/.test(
+      lower
+    )
+  );
+}
+
+function bestImageUrl(node: any): string | null {
+  const cands: Array<{ url?: string; width?: number }> =
+    node?.image_versions2?.candidates ||
+    (node?.display_resources || []).map((r: any) => ({ url: r.src, width: r.config_width })) ||
+    [];
+  const sorted = [...cands].filter((c) => c?.url).sort((a, b) => (b.width || 0) - (a.width || 0));
+  return sorted[0]?.url || node?.display_url || null;
+}
+
+/** Understands both the legacy GraphQL reel shape and the v1 reels_media shape. */
+function parseReelItems(reel: any): { items: StoryItem[]; reel: any } {
+  const raw = reel?.items || (reel?.edge_highlight_reel_to_media?.edges || []).map((e: any) => e?.node) || [];
+  const items: StoryItem[] = [];
+  for (const node of raw) {
+    if (!node) continue;
+    const vids: any[] = node.video_resources || node.video_versions || [];
+    const rawVid: string | undefined = vids[0]?.src || vids[0]?.url || node.video_url;
+    const rawImg = bestImageUrl(node);
+    const isVid = Boolean(rawVid) && Boolean(node.is_video || vids.length || node.video_url);
+    const mediaUrl = isVid ? rawVid! : rawImg;
+    if (!mediaUrl || isPlaceholderAsset(mediaUrl)) continue;
+    const ts = node.taken_at_timestamp || node.taken_at;
+    items.push({
+      type: isVid ? "video" : "photo",
+      url: mediaUrl,
+      thumbnail: rawImg && !isPlaceholderAsset(rawImg) ? rawImg : null,
+      duration: node.video_duration ? Number(node.video_duration) : null,
+      takenAt: ts ? new Date(Number(ts) * 1000).toISOString().split("T")[0] : null,
+    });
+  }
+  return { items, reel };
+}
+
+function reelToFetch(engine: string, reel: any): StoryFetch | null {
+  const { items } = parseReelItems(reel);
+  if (!items.length) return null;
+  const u = reel?.user || reel?.owner;
+  const coverRaw = reel?.cover_media?.cropped_image_version?.url;
+  return {
+    engine,
+    items,
+    title: reel?.title || undefined,
+    cover: coverRaw && !isPlaceholderAsset(coverRaw) ? coverRaw : null,
+    creator: u
+      ? {
+          handle: u.username || null,
+          name: u.full_name || u.username || null,
+          verified: Boolean(u.is_verified),
+          avatarUrl: u.profile_pic_url || null,
+          profileUrl: u.username ? `https://www.instagram.com/${u.username}/` : null,
+        }
+      : undefined,
+  };
+}
+
+/** Stage 1a: anonymous/session GraphQL reel query + v1 reels_media. */
+async function igStageGraphQL(t: StoryTarget, customCookie?: string): Promise<StoryFetch | null> {
+  const rawCookie = customCookie || process.env.IG_COOKIE || process.env.INSTAGRAM_COOKIE || "";
+  const igCookie = rawCookie.includes("=") ? rawCookie : rawCookie ? `sessionid=${rawCookie}` : "";
+  const headers: Record<string, string> = {
+    "User-Agent": INSTAGRAM_EMBED_UA,
+    "x-ig-app-id": IG_APP_ID,
+    Accept: "application/json",
+    "X-Requested-With": "XMLHttpRequest",
+    Referer: "https://www.instagram.com/",
+    ...(igCookie ? { Cookie: igCookie } : {}),
+  };
+  const getJson = async (url: string): Promise<any | null> => {
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return null;
+      }
+      return await res.json();
+    } catch {
+      return null;
+    }
+  };
+
+  let targetUserId = t.userId;
+  if (!targetUserId && t.username) {
+    try {
+      const embedRes = await fetch(`https://www.instagram.com/${encodeURIComponent(t.username)}/embed/`, {
+        headers: { "User-Agent": INSTAGRAM_EMBED_UA },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (embedRes.ok) {
+        const html = await embedRes.text();
+        const parsedContext = parseInstagramContextJson(html);
+        if (parsedContext?.context?.id) {
+          targetUserId = String(parsedContext.context.id);
+        }
+      }
+    } catch {}
+  }
+
+  const reelId = t.highlightId ? `highlight:${t.highlightId}` : targetUserId;
+  for (const hash of IG_GRAPHQL_HASHES) {
+    const variables = {
+      reel_ids: targetUserId ? [targetUserId] : [],
+      tag_names: [],
+      location_ids: [],
+      highlight_reel_ids: t.highlightId ? [t.highlightId] : [],
+      precomposed_overlay: false,
+      show_story_viewer_list: false,
+    };
+    if (!variables.reel_ids.length && !variables.highlight_reel_ids.length) break;
+    const json = await getJson(
+      `https://www.instagram.com/graphql/query/?query_hash=${hash}&variables=${encodeURIComponent(JSON.stringify(variables))}`
+    );
+    const reel =
+      json?.data?.reels_media?.[0] || json?.data?.user?.reel || json?.data?.highlight_reel || null;
+    const out = reel ? reelToFetch("graphql", reel) : null;
+    if (out) return out;
+  }
+
+  if (reelId) {
+    const json = await getJson(
+      `https://i.instagram.com/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelId)}`
+    );
+    const reel = json?.reels?.[reelId] || json?.reels_media?.[0] || null;
+    const out = reel ? reelToFetch("reels_media", reel) : null;
+    if (out) return out;
+  }
+  return null;
+}
+
+/** Stage 1b: public /embed/ page for the story's media shortcode (login shell is detected and skipped). */
+async function igStageEmbed(t: StoryTarget): Promise<StoryFetch | null> {
+  const shortcodes = Array.from(
+    new Set([t.storyId, t.storyMediaId].map((id) => idToShortcode(id)).filter(Boolean))
+  );
+  const candidates = shortcodes.flatMap((sc) => [
+    `https://www.instagram.com/p/${sc}/embed/captioned/`,
+    `https://www.instagram.com/p/${sc}/embed/`,
+  ]);
+
+  for (const candidate of candidates) {
+    try {
+      const res = await fetch(candidate, {
+        headers: {
+          "User-Agent": INSTAGRAM_EMBED_UA,
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        continue;
+      }
+      const html = await res.text();
+      const $ = cheerio.load(html);
+      const ogImage = $('meta[property="og:image"]').attr("content");
+      const ogVideo =
+        $('meta[property="og:video"]').attr("content") ||
+        $('meta[property="og:video:secure_url"]').attr("content");
+      if (
+        html.includes('"LoginAndSignupPage"') ||
+        (!ogVideo && !html.includes(".mp4") && (!ogImage || isPlaceholderAsset(ogImage)))
+      ) {
+        continue;
+      }
+
+      let video: string | null = null;
+      const mp4Idx = html.indexOf(".mp4");
+      if (mp4Idx !== -1) {
+        const start = html.lastIndexOf("https:", mp4Idx);
+        const end = html.indexOf('"', mp4Idx);
+        if (start !== -1 && end > start) video = decodeEscapedUrl(html.slice(start, end));
+      }
+      if (!video && ogVideo) video = decodeEscapedUrl(ogVideo);
+      if (video && isPlaceholderAsset(video)) video = null;
+
+      const embedImg = $("img.EmbeddedMediaImage").first();
+      let image: string | null =
+        parseBestSrcsetUrl(embedImg.attr("srcset")) ||
+        (embedImg.attr("src") ? decodeEscapedUrl(embedImg.attr("src")!) : null) ||
+        (ogImage ? decodeEscapedUrl(ogImage) : null) ||
+        (html.match(/"display_url":\s*"([^"]+)"/)?.[1] ? decodeEscapedUrl(html.match(/"display_url":\s*"([^"]+)"/)![1]) : null);
+      if (image && isPlaceholderAsset(image)) image = null;
+
+      const mediaUrl = video || image;
+      if (!mediaUrl) continue;
+
+      const user = $(".Username").text().trim().split(/\s+/)[0]?.replace(/Verified.*$/i, "") || "";
+      return {
+        engine: "embed",
+        items: [{ type: video ? "video" : "photo", url: mediaUrl, thumbnail: image, duration: null, takenAt: null }],
+        cover: image,
+        creator: user
+          ? { handle: user, name: user, profileUrl: `https://www.instagram.com/${user}/`, verified: false }
+          : undefined,
+      };
+    } catch {
+      // next candidate
+    }
+  }
+  return null;
+}
+
+// ---- Stage 2: public mirrors -------------------------------------------------
+
+interface MirrorConfig {
+  name: string;
+  endpoint: string;
+  method?: "POST" | "GET";
+  encoding?: "form" | "json";
+  /** Field that carries the story/highlight URL. */
+  urlField?: string;
+  /** Extra static fields to send. */
+  fields?: Record<string, string>;
+  /** If set, this page is fetched first and its hidden <input>s (CSRF tokens etc.) are echoed back. */
+  tokenPage?: string;
+  referer?: string;
+}
+
+/**
+ * Default public story-downloader mirrors. These third-party sites change their endpoints and
+ * anti-bot tokens often; override or extend the list without touching code by setting
+ * IG_MIRROR_ENDPOINTS to a JSON array of MirrorConfig objects.
+ */
+const DEFAULT_IG_MIRRORS: MirrorConfig[] = [
+  {
+    name: "sssinstagram",
+    endpoint: "https://sssinstagram.com/api/convert",
+    encoding: "json",
+    urlField: "target_url",
+    referer: "https://sssinstagram.com/",
+  },
+  {
+    name: "indown",
+    endpoint: "https://indown.io/download",
+    encoding: "form",
+    urlField: "link",
+    tokenPage: "https://indown.io/",
+    referer: "https://indown.io/",
+  },
+  {
+    name: "snapinsta",
+    endpoint: "https://snapinsta.app/action2.php",
+    encoding: "form",
+    urlField: "url",
+    fields: { action: "post", lang: "en" },
+    tokenPage: "https://snapinsta.app/",
+    referer: "https://snapinsta.app/",
+  },
+  {
+    name: "fastdl",
+    endpoint: "https://fastdl.app/api/convert",
+    encoding: "json",
+    urlField: "target_url",
+    referer: "https://fastdl.app/",
+  },
+];
+
+function loadMirrorConfigs(): MirrorConfig[] {
+  const raw = process.env.IG_MIRROR_ENDPOINTS;
+  if (!raw) return DEFAULT_IG_MIRRORS;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.length) return parsed as MirrorConfig[];
+  } catch {
+    // fall back to defaults
+  }
+  return DEFAULT_IG_MIRRORS;
+}
+
+interface RawMirrorLink {
+  url: string;
+  type?: "video" | "photo";
+  thumb?: string | null;
+}
+
+const MIRROR_VIDEO_HINT = /\.mp4(?:[?#]|$)|video|\bmp4\b/i;
+const MIRROR_IMAGE_HINT = /\.(?:jpe?g|webp|png|heic)(?:[?#]|$)|photo|image|\bjpe?g\b/i;
+const MIRROR_THUMB_KEY = /thumb|cover|poster|preview|avatar|profile|logo|icon/i;
+
+/** Explicit file extensions win over loose words like "video"/"photo". */
+function guessMirrorType(hay: string): "video" | "photo" | undefined {
+  if (/\.mp4(?:[?#\s]|$)/i.test(hay)) return "video";
+  if (/\.(?:jpe?g|webp|png|heic)(?:[?#\s]|$)/i.test(hay)) return "photo";
+  if (MIRROR_VIDEO_HINT.test(hay)) return "video";
+  if (MIRROR_IMAGE_HINT.test(hay)) return "photo";
+  return undefined;
+}
+
+/** Pulls candidate media links out of whatever a mirror returned (JSON, JSON-wrapped HTML, or HTML). */
+function extractMirrorLinks(body: string, baseUrl: string): RawMirrorLink[] {
+  const out: RawMirrorLink[] = [];
+  const abs = (u: string): string | null => {
+    try {
+      return new URL(decodeEscapedUrl(u.trim()), baseUrl).toString();
+    } catch {
+      return null;
+    }
+  };
+
+  const fromHtml = (html: string) => {
+    const $ = cheerio.load(html);
+    $("a[href], video[src], video source[src]").each((_: number, el: any) => {
+      const $el = $(el);
+      const href = $el.attr("href") || $el.attr("src");
+      const url = href ? abs(href) : null;
+      if (!url) return;
+      const text = `${$el.text()} ${$el.attr("download") || ""} ${$el.attr("class") || ""} ${$el.attr("title") || ""}`;
+      const tag = (el as any).tagName?.toLowerCase();
+      const looksLikeDownload =
+        tag !== "a" ||
+        $el.attr("download") !== undefined ||
+        /download|save|video|photo|image|\bhd\b/i.test(text) ||
+        MIRROR_VIDEO_HINT.test(url) ||
+        MIRROR_IMAGE_HINT.test(url) ||
+        /cdninstagram|fbcdn/i.test(url);
+      if (!looksLikeDownload) return;
+      const scope = $el.closest("div, li, article, section, tr");
+      const thumbRaw = scope.find("img").first().attr("src") || scope.find("video").first().attr("poster");
+      const type: "video" | "photo" | undefined = tag !== "a" ? "video" : guessMirrorType(`${url} ${text}`);
+      out.push({ url, type, thumb: thumbRaw ? abs(thumbRaw) : null });
+    });
+  };
+
+  const walk = (node: any, key = "") => {
+    if (typeof node === "string") {
+      if (/<(?:a|video|source)\b/i.test(node)) {
+        fromHtml(node);
+      } else if (/^https?:\/\//i.test(node) && !MIRROR_THUMB_KEY.test(key)) {
+        const url = abs(node);
+        if (url && (MIRROR_VIDEO_HINT.test(url) || MIRROR_IMAGE_HINT.test(url) || /cdninstagram|fbcdn|download|\/get\?/i.test(url))) {
+          out.push({ url, type: guessMirrorType(`${url} ${key}`) });
+        }
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      node.forEach((n) => walk(n, key));
+    } else if (node && typeof node === "object") {
+      const thumbKey = Object.keys(node).find((k) => MIRROR_THUMB_KEY.test(k) && typeof node[k] === "string");
+      const before = out.length;
+      for (const [k, v] of Object.entries(node)) walk(v, k);
+      if (thumbKey) {
+        const thumb = abs(node[thumbKey]);
+        for (let i = before; i < out.length; i++) if (!out[i].thumb) out[i].thumb = thumb;
+      }
+    }
+  };
+
+  const trimmed = body.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      walk(JSON.parse(trimmed));
+    } catch {
+      fromHtml(body);
+    }
+  } else {
+    fromHtml(body);
+  }
+  return out;
+}
+
+/** Resolves a mirror link whose type is unknown by asking the server for the first byte. */
+async function probeMediaType(url: string): Promise<"video" | "photo" | null> {
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": DESKTOP_UA, Range: "bytes=0-0" },
+      signal: AbortSignal.timeout(6000),
+    });
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    await res.body?.cancel().catch(() => {});
+    if (ct.startsWith("video/")) return "video";
+    if (ct.startsWith("image/")) return "photo";
+  } catch {
+    // unknown
+  }
+  return null;
+}
+
+async function runMirror(cfg: MirrorConfig, targetUrl: string): Promise<StoryItem[]> {
+  const fields: Record<string, string> = { ...(cfg.fields || {}) };
+  const headers: Record<string, string> = {
+    "User-Agent": DESKTOP_UA,
+    Accept: "application/json, text/html, */*;q=0.8",
+    "X-Requested-With": "XMLHttpRequest",
+  };
+  if (cfg.referer) {
+    headers.Referer = cfg.referer;
+    headers.Origin = new URL(cfg.referer).origin;
+  }
+
+  if (cfg.tokenPage) {
+    try {
+      const page = await fetch(cfg.tokenPage, { headers: { "User-Agent": DESKTOP_UA }, signal: AbortSignal.timeout(8000) });
+      const cookie = page.headers.get("set-cookie")?.split(";")[0];
+      if (cookie) headers.Cookie = cookie;
+      const $ = cheerio.load(await page.text());
+      $("form input[type=hidden][name]").each((_: number, el: any) => {
+        const name = $(el).attr("name");
+        const value = $(el).attr("value");
+        if (name && value !== undefined && !(name in fields)) fields[name] = value;
+      });
+    } catch {
+      // continue without tokens
+    }
+  }
+  fields[cfg.urlField || "url"] = targetUrl;
+
+  const method = cfg.method || "POST";
+  let endpoint = cfg.endpoint;
+  let init: RequestInit = { method, headers, signal: AbortSignal.timeout(15000) };
+  if (method === "GET") {
+    endpoint += (endpoint.includes("?") ? "&" : "?") + new URLSearchParams(fields).toString();
+  } else if (cfg.encoding === "json") {
+    headers["Content-Type"] = "application/json";
+    init = { ...init, body: JSON.stringify(fields) };
+  } else {
+    headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8";
+    init = { ...init, body: new URLSearchParams(fields).toString() };
+  }
+
+  const res = await fetch(endpoint, init);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    return [];
+  }
+  const links = extractMirrorLinks(await res.text(), endpoint);
+
+  const seen = new Set<string>();
+  const items: StoryItem[] = [];
+  for (const link of links) {
+    if (seen.has(link.url) || isPlaceholderAsset(link.url)) continue;
+    // a thumbnail-only <img> that was picked up as a link must not become a story of its own
+    if (links.some((other) => other !== link && other.thumb === link.url)) continue;
+    seen.add(link.url);
+    const type = link.type || (await probeMediaType(link.url));
+    if (!type) continue;
+    items.push({
+      type,
+      url: link.url,
+      thumbnail: link.thumb && !isPlaceholderAsset(link.thumb) ? link.thumb : type === "photo" ? link.url : null,
+      duration: null,
+      takenAt: null,
+    });
+  }
+  return items;
+}
+
+/** Stage 2: try each public mirror in order until one returns real media. */
+async function igStageMirrors(t: StoryTarget): Promise<StoryFetch | null> {
+  for (const cfg of loadMirrorConfigs()) {
+    try {
+      const items = await runMirror(cfg, t.canonicalUrl);
+      if (items.length) return { engine: `mirror:${cfg.name}`, items };
+    } catch {
+      // next mirror
+    }
+  }
+  return null;
+}
+
+/** Stage 3: yt-dlp scraper fallback (with optional IG_COOKIE header) */
+async function igStageYtDlp(t: StoryTarget, customCookie?: string): Promise<StoryFetch | null> {
+  try {
+    const rawCookie = customCookie || process.env.IG_COOKIE || process.env.INSTAGRAM_COOKIE || "";
+    const igCookie = rawCookie.includes("=") ? rawCookie : rawCookie ? `sessionid=${rawCookie}` : "";
+    const args = ["--dump-single-json", "--no-warnings", t.canonicalUrl];
+    if (igCookie) {
+      args.push("--add-header", `Cookie:${igCookie}`);
+    }
+    const { stdout } = await execFileAsync(ytDlpPath, args, { maxBuffer: 30 * 1024 * 1024, timeout: 15000 });
+    if (stdout) {
+      const ytd = JSON.parse(stdout);
+      const entries = Array.isArray(ytd.entries) ? ytd.entries : [ytd];
+      const items: StoryItem[] = [];
+      for (const entry of entries) {
+        if (!entry) continue;
+        const vidUrl = entry.url || entry.requested_formats?.[0]?.url || entry.formats?.find((f: any) => f.url && f.ext === "mp4")?.url;
+        const thumb = entry.thumbnail || null;
+        const isVid = Boolean(vidUrl && (entry.ext === "mp4" || entry.vcodec !== "none"));
+        const mediaUrl = isVid ? vidUrl : (thumb || entry.url);
+        if (mediaUrl && !isPlaceholderAsset(mediaUrl)) {
+          items.push({
+            type: isVid ? "video" : "photo",
+            url: mediaUrl,
+            thumbnail: thumb && !isPlaceholderAsset(thumb) ? thumb : null,
+            duration: entry.duration ? Number(entry.duration) : null,
+            takenAt: entry.timestamp ? new Date(entry.timestamp * 1000).toISOString().split("T")[0] : null,
+          });
+        }
+      }
+      if (items.length) {
+        return {
+          engine: "yt-dlp",
+          items,
+          title: ytd.title || (t.username ? `@${t.username}'s Story` : "Instagram Story"),
+          creator: ytd.uploader ? { handle: ytd.uploader, name: ytd.uploader } : undefined,
+        };
+      }
+    }
+  } catch {}
+  return null;
+}
+
+async function fetchInstagramStoryMedia(t: StoryTarget, customCookie?: string): Promise<StoryFetch | null> {
+  const stages: Array<() => Promise<StoryFetch | null>> = [
+    () => igStageGraphQL(t, customCookie),
+    () => igStageEmbed(t),
+    () => igStageMirrors(t),
+    () => igStageYtDlp(t, customCookie),
+  ];
+  for (const stage of stages) {
+    const out = await stage();
+    if (out?.items.length) return out;
+  }
+  return null;
 }
 
 function isProfileUrl(url: string, platform: Platform): { isProfile: boolean; handle: string | null } {
@@ -583,6 +1488,7 @@ interface PlatformExtractResult {
   audioUrl: string | null;
   audioAvailable: boolean;
   isCarousel: boolean;
+  mediaType?: "video" | "slideshow";
   creator: DownloadCreator;
   media: DownloadMedia[];
 }
@@ -773,189 +1679,11 @@ async function extractTikTok(
     };
   }
 
-  // Strategy A: TikWM Direct Scraper API (supports vt.tiktok.com, /story/, photo slideshows, and HD video)
-  const isStory = /\/story\//i.test(targetUrl);
-  try {
-    let tikwmData: any = null;
-
-    // A1: Try GET with query param https://www.tikwm.com/api/?url={unshortened_url}
-    try {
-      const getRes = await fetch(
-        `https://www.tikwm.com/api/?url=${encodeURIComponent(targetUrl)}&hd=1`,
-        {
-          headers: {
-            "User-Agent": MOBILE_TIKTOK_UA,
-            Accept: "application/json, text/javascript, */*; q=0.01",
-          },
-          signal: AbortSignal.timeout(8000),
-        }
-      );
-      if (getRes.ok) {
-        const json = await getRes.json();
-        if (json?.data && (json.data.play || json.data.hdplay || (Array.isArray(json.data.images) && json.data.images.length > 0))) {
-          tikwmData = json.data;
-        }
-      }
-    } catch {
-      // Fallback to POST below
-    }
-
-    // A2: Try POST fallback
-    if (!tikwmData) {
-      const formBody = new URLSearchParams();
-      formBody.set("url", targetUrl);
-      formBody.set("hd", "1");
-
-      const tikwmRes = await fetch("https://www.tikwm.com/api/", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-          "User-Agent": DESKTOP_UA,
-          Accept: "application/json, text/javascript, */*; q=0.01",
-          Origin: "https://www.tikwm.com",
-          Referer: "https://www.tikwm.com/",
-        },
-        body: formBody.toString(),
-        signal: AbortSignal.timeout(10000),
-      });
-
-      if (tikwmRes.ok) {
-        const payload = await tikwmRes.json();
-        if (payload?.data && (payload.data.play || payload.data.hdplay || (Array.isArray(payload.data.images) && payload.data.images.length > 0))) {
-          tikwmData = payload.data;
-        }
-      }
-    }
-
-    if (tikwmData) {
-      const d = tikwmData;
-      title = d.title || (isStory ? "TikTok Story" : "TikTok Post");
-      caption = d.title || "";
-      if (d.create_time) {
-        uploadDate = new Date(d.create_time * 1000).toISOString().split("T")[0];
-      }
-
-        if (d.author) {
-          creator.handle = d.author.unique_id || null;
-          creator.name = d.author.nickname || d.author.unique_id || null;
-          if (creator.handle) {
-            creator.profileUrl = `https://www.tiktok.com/@${creator.handle}`;
-          }
-          if (d.author.avatar) {
-            const rawAvatar = d.author.avatar.startsWith("http")
-              ? d.author.avatar
-              : `https://www.tikwm.com${d.author.avatar}`;
-            creator.avatarUrl = buildStreamUrl(rawAvatar, `${creator.handle || "creator"}-avatar.jpg`, true);
-          }
-        }
-
-        const rawCover = d.origin_cover || d.cover;
-        if (rawCover) {
-          const fullCover = rawCover.startsWith("http")
-            ? rawCover
-            : `https://www.tikwm.com${rawCover}`;
-          thumbnail = buildStreamUrl(fullCover, "thumbnail.jpg", true);
-        }
-
-        const rawMusic = d.music || d.music_info?.play;
-        if (rawMusic && typeof rawMusic === "string") {
-          const fullMusic = rawMusic.startsWith("http")
-            ? rawMusic
-            : `https://www.tikwm.com${rawMusic}`;
-          audioUrl = fullMusic;
-          audioAvailable = true;
-        }
-
-        const isStoryPost = isStory || Boolean(d.is_story) || targetUrl.includes("/story/");
-        const cleanPlayUrl = d.play
-          ? d.play.startsWith("http")
-            ? d.play
-            : `https://www.tikwm.com${d.play}`
-          : null;
-        const hdUrl = d.hdplay
-          ? d.hdplay.startsWith("http")
-            ? d.hdplay
-            : `https://www.tikwm.com${d.hdplay}`
-          : null;
-
-        const width = d.width || 1080;
-        const height = d.height || 1920;
-        const aspectRatio = computeAspectRatio(width, height, "vertical");
-        const hasVideo = Boolean(cleanPlayUrl || hdUrl);
-        const hasImages = Array.isArray(d.images) && d.images.length > 0;
-
-        // If clean watermark-free video stream exists, add it as primary media stream for CupertinoVideoPlayer
-        if (cleanPlayUrl) {
-          media.push({
-            url: buildStreamUrl(cleanPlayUrl, safeFilename(title, "mp4"), true),
-            rawUrl: cleanPlayUrl,
-            downloadUrl: buildStreamUrl(cleanPlayUrl, safeFilename(`${title}-watermark-free`, "mp4"), false),
-            thumbnail,
-            type: "video",
-            quality: isStoryPost ? "Clean Story Video (Watermark-Free) · 1080p" : "Clean Video (Watermark-Free) · 1080p",
-            format: "mp4",
-            width,
-            height,
-            aspectRatio,
-            hasAudio: true,
-          });
-          audioAvailable = true;
-        }
-
-        if (hdUrl && hdUrl !== cleanPlayUrl) {
-          media.push({
-            url: buildStreamUrl(hdUrl, safeFilename(title, "mp4"), true),
-            rawUrl: hdUrl,
-            downloadUrl: buildStreamUrl(hdUrl, safeFilename(`${title}-hd-1080p`, "mp4"), false),
-            thumbnail,
-            type: "video",
-            quality: "Full HD · 1080p",
-            format: "mp4",
-            width,
-            height,
-            aspectRatio,
-            hasAudio: true,
-          });
-          audioAvailable = true;
-        }
-
-        // Add slide photos if present (slideshows or photo stories)
-        if (hasImages) {
-          if (!hasVideo) {
-            isCarousel = d.images.length > 1;
-          }
-          d.images.forEach((imgUrl: string, idx: number) => {
-            if (!imgUrl) return;
-            const fullImg = imgUrl.startsWith("http") ? imgUrl : `https://www.tikwm.com${imgUrl}`;
-            const proxiedPreview = buildStreamUrl(fullImg, `slide-${idx + 1}.jpg`, true);
-            const proxiedDownload = buildStreamUrl(
-              fullImg,
-              safeFilename(`${title}-slide-${idx + 1}`, "jpg"),
-              false
-            );
-            media.push({
-              url: proxiedPreview,
-              rawUrl: fullImg,
-              downloadUrl: proxiedDownload,
-              thumbnail: proxiedPreview,
-              type: "image",
-              quality: `Slide ${idx + 1} · Full HD`,
-              format: "jpg",
-              width: 1080,
-              height: 1440,
-              aspectRatio: "vertical",
-              hasAudio: false,
-            });
-          });
-        }
-
-        if (!thumbnail && media[0]) {
-          thumbnail = media[0].thumbnail || media[0].url;
-        }
-      }
-    } catch {
-    // Fallback to direct page hydration scraping below
-  }
+  // Strategy A: dedicated TikTok unshortener + TikWM public API (videos, Stories, slideshows)
+  const canonicalUrl = await unshortenTikTok(targetUrl);
+  const viaTikWm = await extractTikTokViaTikWm(canonicalUrl, targetUrl);
+  if (viaTikWm) return viaTikWm;
+  targetUrl = canonicalUrl;
 
   // Strategy B: Direct TikTok HTML Hydration JSON (__UNIVERSAL_DATA_FOR_REHYDRATION__)
   if (media.length === 0) {
@@ -1092,7 +1820,8 @@ async function extractTikTok(
 async function extractInstagram(
   targetUrl: string,
   isProfile: boolean,
-  profileHandle: string | null
+  profileHandle: string | null,
+  customCookie?: string
 ): Promise<PlatformExtractResult> {
   let title = "";
   let caption = "";
@@ -1109,6 +1838,64 @@ async function extractInstagram(
     verified: false,
   };
   const media: DownloadMedia[] = [];
+
+  // 0. Story / Highlight Mode
+  const storyTarget = parseStoryTarget(targetUrl);
+  if (storyTarget) {
+    const fetched = await fetchInstagramStoryMedia(storyTarget, customCookie);
+    if (fetched && fetched.items.length) {
+      const storyTitle =
+        fetched.title ||
+        (storyTarget.kind === "highlight" ? "Instagram Highlight" : `@${storyTarget.username}'s Story`);
+      creator.handle = fetched.creator?.handle || storyTarget.username || creator.handle;
+      creator.name = fetched.creator?.name || creator.handle;
+      creator.verified = Boolean(fetched.creator?.verified);
+      creator.profileUrl = creator.handle ? `https://www.instagram.com/${creator.handle}/` : null;
+      if (fetched.creator?.avatarUrl) {
+        creator.avatarUrl = buildStreamUrl(fetched.creator.avatarUrl, `${creator.handle || "creator"}-avatar.jpg`, true);
+      }
+      fetched.items.forEach((it, idx) => {
+        const n = idx + 1;
+        const isVid = it.type === "video";
+        const ext = isVid ? "mp4" : "jpg";
+        const streamUrl = buildStreamUrl(it.url, `story-${n}.${ext}`, true);
+        const dlUrl = buildStreamUrl(it.url, safeFilename(`${storyTitle}-story-${n}`, ext), false);
+        const thumb = it.thumbnail
+          ? buildStreamUrl(it.thumbnail, `story-thumb-${n}.jpg`, true)
+          : isVid
+          ? null
+          : streamUrl;
+        media.push({
+          url: streamUrl,
+          rawUrl: it.url,
+          downloadUrl: dlUrl,
+          thumbnail: thumb,
+          type: isVid ? "video" : "image",
+          quality: isVid ? `Story Video ${n} · HD` : `Story Photo ${n} · HD`,
+          format: ext,
+          width: 1080,
+          height: 1920,
+          aspectRatio: "vertical",
+          hasAudio: isVid,
+        });
+        if (isVid) {
+          audioAvailable = true;
+          if (!audioUrl) audioUrl = it.url;
+        }
+      });
+      return {
+        title: storyTitle,
+        caption: `Instagram Story / Highlight (${media.length} items)`,
+        thumbnail: media[0]?.thumbnail || media[0]?.url || null,
+        uploadDate: fetched.items[0]?.takenAt || null,
+        audioUrl,
+        audioAvailable,
+        isCarousel: media.length > 1,
+        creator,
+        media,
+      };
+    }
+  }
 
   // 1. Profile Photo (DP) Mode
   if (isProfile) {
@@ -1498,6 +2285,8 @@ async function extractInstagram(
               hasAudio: false,
             });
           }
+        }
+
         // Reel MP4 Video Scan from Embed HTML
         if ((isReel || targetUrl.includes("/reel/") || html.includes(".mp4")) && media.every((m) => m.type !== "video")) {
           const mp4Idx = html.indexOf(".mp4");
@@ -1752,6 +2541,21 @@ async function extractPinterest(
   };
 }
 
+function getYtDlpCookieArgs(): string[] {
+  const ytCookie = process.env.YOUTUBE_COOKIE || process.env.YT_COOKIE || "";
+  if (ytCookie) {
+    const tmpCookiePath = "/tmp/omni-yt-cookie.txt";
+    try {
+      fs.writeFileSync(tmpCookiePath, ytCookie);
+      return ["--cookies", tmpCookiePath];
+    } catch {}
+  }
+  if (fs.existsSync("./cookies.txt")) {
+    return ["--cookies", "./cookies.txt"];
+  }
+  return [];
+}
+
 // ============================================================================
 // YOUTUBE EXTRACTOR (Videos, Shorts, 4K/1440p/1080p/720p/480p, MP3 Audio & Channel DP)
 // ============================================================================
@@ -1847,12 +2651,13 @@ async function extractYouTube(
   // 2. Video / Shorts Mode via yt-dlp & multi-engine fallback
   if (media.length === 0) {
     let ytData: any = null;
+    const cookieArgs = getYtDlpCookieArgs();
 
     // Strategy A: Full progressive/merged format extraction via standard yt-dlp (up to 4K / 2160p)
     try {
       const { stdout } = await execFileAsync(
         ytDlpPath,
-        ["--dump-single-json", "--no-warnings", targetUrl],
+        ["--dump-single-json", "--no-warnings", ...cookieArgs, targetUrl],
         { maxBuffer: 50 * 1024 * 1024, timeout: 20000 }
       );
       if (stdout) {
@@ -1868,6 +2673,7 @@ async function extractYouTube(
             "--no-warnings",
             "--extractor-args",
             "youtube:player_client=android",
+            ...cookieArgs,
             targetUrl,
           ],
           { maxBuffer: 50 * 1024 * 1024, timeout: 20000 }
@@ -1885,6 +2691,7 @@ async function extractYouTube(
               "--no-warnings",
               "--extractor-args",
               "youtube:player_client=android,web",
+              ...cookieArgs,
               targetUrl,
             ],
             { maxBuffer: 50 * 1024 * 1024, timeout: 20000 }
@@ -2195,7 +3002,7 @@ app.get("/api/stream", async (req: Request, res: Response) => {
 app.post("/api/extract", async (req: Request, res: Response) => {
   try {
     pruneCache();
-    const { url: rawInput, mode: requestedMode = "post", platform: requestedPlatform } = req.body;
+    const { url: rawInput, mode: requestedMode = "post", platform: requestedPlatform, cookie: userCookie } = req.body;
 
     if (!rawInput || typeof rawInput !== "string") {
       res.status(400).json({ error: "A valid public URL or @username is required." });
@@ -2275,7 +3082,7 @@ app.post("/api/extract", async (req: Request, res: Response) => {
     if (platform === "tiktok") {
       extracted = await extractTikTok(targetUrl, isProfile, detectedHandle);
     } else if (platform === "instagram") {
-      extracted = await extractInstagram(targetUrl, isProfile, detectedHandle);
+      extracted = await extractInstagram(targetUrl, isProfile, detectedHandle, userCookie);
     } else if (platform === "youtube") {
       extracted = await extractYouTube(targetUrl, isProfile, detectedHandle);
     } else {
@@ -2302,6 +3109,12 @@ app.post("/api/extract", async (req: Request, res: Response) => {
     }
 
     const downloadId = uuidv4().replace(/-/g, "");
+    extracted.media = extracted.media.map((m) => ({
+      ...m,
+      downloadUrl: m.downloadUrl && m.downloadUrl.includes("downloadId=pending")
+        ? m.downloadUrl.replace("downloadId=pending", `downloadId=${downloadId}`)
+        : m.downloadUrl,
+    }));
     resultCache.set(downloadId, {
       createdAt: Date.now(),
       sourceUrl: targetUrl,
@@ -2323,6 +3136,7 @@ app.post("/api/extract", async (req: Request, res: Response) => {
       status: "success",
       platform,
       type: resultType,
+      mediaType: extracted.mediaType,
       title: extracted.title,
       caption: extracted.caption,
       description: extracted.caption,
@@ -2353,7 +3167,7 @@ app.post("/api/extract", async (req: Request, res: Response) => {
 app.post("/api/highlight", async (req: Request, res: Response) => {
   try {
     pruneCache();
-    const { url: rawUrl } = req.body;
+    const { url: rawUrl, cookie: userCookie } = req.body;
 
     if (!rawUrl || typeof rawUrl !== "string") {
       res.status(400).json({ error: "Paste an Instagram Story or Highlight link." });
@@ -2362,447 +3176,128 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
 
     let normalized = rawUrl.trim();
     if (!normalized.includes("://")) normalized = `https://${normalized}`;
-    const targetUrl = await resolveShortUrl(normalized);
-    const platform = detectPlatform(targetUrl);
+    const resolvedUrl = await resolveShortUrl(normalized);
 
-    if (platform !== "instagram") {
+    if (detectPlatform(resolvedUrl) !== "instagram") {
       res.status(400).json({ error: "Instagram Stories and Highlights links are supported here." });
       return;
     }
 
-    let title = "Instagram Story";
-    let cover: string | null = null;
-    const creator: DownloadCreator = {
-      handle: null,
-      name: null,
-      avatarUrl: null,
-      profileUrl: null,
-      verified: false,
-    };
-    const stories: HighlightStory[] = [];
-    const media: DownloadMedia[] = [];
-
-    const parsedTarget = new URL(targetUrl);
-    const pathParts = parsedTarget.pathname.split("/").filter(Boolean);
-    let isHighlightReel = pathParts[0] === "stories" && pathParts[1] === "highlights";
-    let highlightId = isHighlightReel ? pathParts[2] : null;
-    const storyMediaId = parsedTarget.searchParams.get("story_media_id")?.split("_")[0] || null;
-
-    if (pathParts[0] === "s" && pathParts[1]) {
-      try {
-        const decoded = Buffer.from(pathParts[1], "base64").toString("utf-8");
-        const match = decoded.match(/highlight:(\d+)/i);
-        if (match) {
-          highlightId = match[1];
-          isHighlightReel = true;
-        }
-      } catch {}
-    }
-
-    const storyUsername =
-      pathParts[0] === "stories" && pathParts[1] !== "highlights" ? pathParts[1] : null;
-    const storyId =
-      (pathParts[0] === "stories" && pathParts[1] !== "highlights" ? pathParts[2] : null) || storyMediaId;
-
-    if (storyUsername) {
-      creator.handle = storyUsername;
-      creator.name = storyUsername;
-      creator.profileUrl = `https://www.instagram.com/${storyUsername}/`;
-      title = `@${storyUsername}'s Story`;
-    } else if (highlightId) {
-      title = "Instagram Highlight";
-    }
-
-    // Engine 1: Instagram Public GraphQL Query & Reels Media API for Highlights
-    if (highlightId || storyMediaId) {
-      try {
-        const reelIds = [highlightId, storyMediaId].filter(Boolean) as string[];
-        const gqlUrl = `https://www.instagram.com/graphql/query/?query_hash=452461e2dc7e6744e242663777b9d502&variables=${encodeURIComponent(
-          JSON.stringify({
-            highlight_reel_ids: highlightId ? [highlightId] : [],
-            reel_ids: reelIds,
-            location_ids: [],
-            precomposed_overlay: false,
-          })
-        )}`;
-
-        const gqlRes = await fetch(gqlUrl, {
-          headers: {
-            "User-Agent": INSTAGRAM_EMBED_UA,
-            "x-ig-app-id": "936619743392459",
-            Accept: "application/json",
-          },
-          signal: AbortSignal.timeout(8000),
-        });
-
-        if (gqlRes.ok) {
-          const gqlData = await gqlRes.json();
-          const reel =
-            gqlData?.data?.user?.reel ||
-            gqlData?.data?.reels_media?.[0] ||
-            gqlData?.data?.highlight_reel;
-          if (reel) {
-            if (reel.user) {
-              creator.handle = reel.user.username || creator.handle;
-              creator.name = reel.user.full_name || creator.handle;
-              creator.verified = Boolean(reel.user.is_verified);
-              if (creator.handle) creator.profileUrl = `https://www.instagram.com/${creator.handle}/`;
-              if (reel.user.profile_pic_url) {
-                creator.avatarUrl = buildStreamUrl(reel.user.profile_pic_url, `${creator.handle}-avatar.jpg`, true);
-              }
-            }
-            if (reel.title) title = reel.title;
-            if (reel.cover_media?.cropped_image_version?.url) {
-              cover = buildStreamUrl(reel.cover_media.cropped_image_version.url, "cover.jpg", true);
-            }
-
-            const items = reel.items || reel.edge_highlight_reel_to_media?.edges;
-            if (Array.isArray(items) && items.length > 0) {
-              items.forEach((it: any, idx: number) => {
-                const node = it?.node || it;
-                const isVid = Boolean(node.is_video || node.video_versions?.length || node.video_resources?.length);
-                const rawVid =
-                  node.video_resources?.[0]?.src ||
-                  node.video_versions?.[0]?.url ||
-                  node.video_url;
-                const rawImg =
-                  node.display_url ||
-                  node.image_versions2?.candidates?.[0]?.url ||
-                  node.display_resources?.[node.display_resources.length - 1]?.src;
-
-                const itemThumb = rawImg ? buildStreamUrl(rawImg, `story-thumb-${idx + 1}.jpg`, true) : cover;
-                const streamUrl = isVid && rawVid
-                  ? buildStreamUrl(rawVid, `story-${idx + 1}.mp4`, true)
-                  : rawImg
-                  ? buildStreamUrl(rawImg, `story-${idx + 1}.jpg`, true)
-                  : "";
-                const dlUrl = isVid && rawVid
-                  ? buildStreamUrl(rawVid, `${safeFilename(title, "mp4")}-story-${idx + 1}.mp4`, false)
-                  : rawImg
-                  ? buildStreamUrl(rawImg, `${safeFilename(title, "jpg")}-story-${idx + 1}.jpg`, false)
-                  : "";
-
-                if (streamUrl) {
-                  stories.push({
-                    storyNumber: idx + 1,
-                    mediaIndex: idx,
-                    type: isVid ? "video" : "photo",
-                    duration: node.video_duration || (isVid ? 15 : null),
-                    thumbnail: itemThumb,
-                    createdAt: node.taken_at_timestamp
-                      ? new Date(node.taken_at_timestamp * 1000).toISOString().split("T")[0]
-                      : new Date().toISOString().split("T")[0],
-                    url: streamUrl,
-                    downloadUrl: dlUrl,
-                  });
-
-                  media.push({
-                    url: streamUrl,
-                    rawUrl: isVid ? rawVid : rawImg,
-                    downloadUrl: dlUrl,
-                    thumbnail: itemThumb,
-                    type: isVid ? "video" : "image",
-                    quality: "Full HD · 1080p",
-                    format: isVid ? "mp4" : "jpg",
-                    width: 1080,
-                    height: 1920,
-                    aspectRatio: "vertical",
-                    hasAudio: isVid,
-                  });
-                }
-              });
-            }
-          }
-        }
-      } catch {
-        // Fallback to reels_media / mirrors below
-      }
-    }
-
-    // Engine 2: Public FastDL / SSSInstagram converter mirror fallback
-    if (stories.length === 0) {
-      try {
-        const mirrorRes = await fetch("https://sssinstagram.com/api/convert", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent": DESKTOP_UA,
-            "X-Requested-With": "XMLHttpRequest",
-            Referer: "https://sssinstagram.com/",
-          },
-          body: JSON.stringify({ target_url: targetUrl }),
-          signal: AbortSignal.timeout(8000),
-        });
-
-        if (mirrorRes.ok) {
-          const mirrorData = await mirrorRes.json();
-          const htmlContent = mirrorData?.data?.html || mirrorData?.html;
-          if (htmlContent && typeof htmlContent === "string") {
-            const $m = cheerio.load(htmlContent);
-            const downloadLinks = $m("a.download-file, a[href*='cdninstagram.com'], a[href*='fbcdn.net']");
-            downloadLinks.each((idx, el) => {
-              const href = $m(el).attr("href");
-              if (!href) return;
-              if (isGenericInstagramLogo(href) || !isAuthenticStoryMedia(href)) return;
-              const isVid = href.includes(".mp4") || href.includes("video") || href.includes("_nc_cat");
-              const streamUrl = buildStreamUrl(href, `story-${idx + 1}.${isVid ? "mp4" : "jpg"}`, true);
-              const dlUrl = buildStreamUrl(href, `${safeFilename(title, "mp4")}-story-${idx + 1}.${isVid ? "mp4" : "jpg"}`, false);
-              stories.push({
-                storyNumber: idx + 1,
-                mediaIndex: idx,
-                type: isVid ? "video" : "photo",
-                duration: isVid ? 15 : null,
-                thumbnail: streamUrl,
-                createdAt: new Date().toISOString().split("T")[0],
-                url: streamUrl,
-                downloadUrl: dlUrl,
-              });
-              media.push({
-                url: streamUrl,
-                rawUrl: href,
-                downloadUrl: dlUrl,
-                thumbnail: streamUrl,
-                type: isVid ? "video" : "image",
-                quality: "Full HD · 1080p",
-                format: isVid ? "mp4" : "jpg",
-                width: 1080,
-                height: 1920,
-                aspectRatio: "vertical",
-                hasAudio: isVid,
-              });
-            });
-          }
-        }
-      } catch {
-        // Fallback to yt-dlp and Embed Scraper below
-      }
-    }
-
-    // Engine 3: Instagram Direct Shortcode Embed Scraper & Public Embed Mirrors
-    if (stories.length === 0) {
-      const candidateUrls: string[] = [];
-      if (storyId) {
-        const sc = idToShortcode(storyId);
-        if (sc) candidateUrls.push(`https://www.instagram.com/p/${sc}/embed/captioned/`);
-      }
-      if (storyMediaId) {
-        const sc = idToShortcode(storyMediaId);
-        if (sc && !candidateUrls.some((u) => u.includes(sc))) {
-          candidateUrls.push(`https://www.instagram.com/p/${sc}/embed/captioned/`);
-        }
-      }
-      candidateUrls.push(
-        targetUrl,
-        `${targetUrl.replace(/\/$/, "")}/embed/captioned/`,
-        `${targetUrl.replace(/\/$/, "")}/embed/`
-      );
-
-      for (const candidate of candidateUrls) {
-        if (stories.length > 0) break;
-        try {
-          const pageRes = await fetch(candidate, {
-            headers: {
-              "User-Agent": INSTAGRAM_EMBED_UA,
-              Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-            signal: AbortSignal.timeout(8000),
-          });
-          if (!pageRes.ok) continue;
-
-          const html = await pageRes.text();
-          const $ = cheerio.load(html);
-
-          const ogTitle = $('meta[property="og:title"]').attr("content");
-          const ogImage = $('meta[property="og:image"]').attr("content");
-          const ogVideo =
-            $('meta[property="og:video"]').attr("content") ||
-            $('meta[property="og:video:secure_url"]').attr("content");
-
-          const isLoginGate =
-            html.includes('"LoginAndSignupPage"') ||
-            (ogTitle && /login\s*•\s*instagram/i.test(ogTitle)) ||
-            (!ogVideo && !html.includes(".mp4") && (!ogImage || isGenericInstagramLogo(ogImage)));
-
-          if (isLoginGate) continue;
-
-          if (ogTitle) title = ogTitle.replace(/\s*•\s*Instagram.*$/i, "").trim();
-
-          // Extract author from embed header
-          const rawUsername = $(".Username").text().trim();
-          if (rawUsername) {
-            const cleanUser = rawUsername.split(/\s+/)[0]?.replace(/Verified.*$/i, "");
-            if (cleanUser && !creator.handle) {
-              creator.handle = cleanUser;
-              creator.name = cleanUser;
-              creator.profileUrl = `https://www.instagram.com/${cleanUser}/`;
-              if (!title || title === "Instagram Story" || title === "Instagram Highlight") {
-                title = `@${cleanUser}'s Story`;
-              }
-            }
-          }
-
-          const rawAvatar = $("img.Avatar").attr("src");
-          if (rawAvatar && isAuthenticStoryMedia(rawAvatar) && !creator.avatarUrl) {
-            creator.avatarUrl = buildStreamUrl(rawAvatar, `${creator.handle || "creator"}-avatar.jpg`, true);
-          }
-
-          // 1. Direct .mp4 video stream detection
-          let directVid: string | null = null;
-          const mp4Idx = html.indexOf(".mp4");
-          if (mp4Idx !== -1) {
-            const start = html.lastIndexOf("https:", mp4Idx);
-            const end = html.indexOf('"', mp4Idx);
-            if (start !== -1 && end !== -1 && end > start) {
-              let raw = html.slice(start, end);
-              try {
-                raw = JSON.parse(`"${raw}"`);
-              } catch {
-                raw = raw.replace(/\\\//g, "/").replace(/\\u0026/g, "&").replace(/\\/g, "");
-              }
-              if (isAuthenticStoryMedia(raw)) {
-                directVid = raw;
-              }
-            }
-          }
-
-          if (!directVid && ogVideo && isAuthenticStoryMedia(ogVideo)) {
-            directVid = decodeEscapedUrl(ogVideo);
-          }
-
-          // 2. Direct high-res photo detection
-          let directImg: string | null = null;
-          const embeddedImgEl = $("img.EmbeddedMediaImage").first();
-          const bestSrcset = parseBestSrcsetUrl(embeddedImgEl.attr("srcset"));
-          const fallbackSrc = embeddedImgEl.attr("src")
-            ? decodeEscapedUrl(embeddedImgEl.attr("src")!)
-            : null;
-          const candidateImg = bestSrcset || fallbackSrc;
-          if (candidateImg && isAuthenticStoryMedia(candidateImg)) {
-            directImg = candidateImg;
-          } else if (ogImage && isAuthenticStoryMedia(ogImage)) {
-            directImg = decodeEscapedUrl(ogImage);
-          } else {
-            const dispMatch = html.match(/"display_url":\s*"([^"]+)"/);
-            if (dispMatch?.[1]) {
-              const decoded = decodeEscapedUrl(dispMatch[1]);
-              if (isAuthenticStoryMedia(decoded)) {
-                directImg = decoded;
-              }
-            }
-          }
-
-          if (directImg && !cover) {
-            cover = buildStreamUrl(directImg, "cover.jpg", true);
-          }
-
-          if (directVid && isAuthenticStoryMedia(directVid)) {
-            const streamUrl = buildStreamUrl(directVid, "story-1.mp4", true);
-            const dlUrl = buildStreamUrl(directVid, `${safeFilename(title, "mp4")}-story-1.mp4`, false);
-            const thumbUrl = directImg ? buildStreamUrl(directImg, "thumb.jpg", true) : cover;
-            stories.push({
-              storyNumber: 1,
-              mediaIndex: 0,
-              type: "video",
-              duration: 15,
-              thumbnail: thumbUrl,
-              createdAt: new Date().toISOString().split("T")[0],
-              url: streamUrl,
-              downloadUrl: dlUrl,
-            });
-            media.push({
-              url: streamUrl,
-              rawUrl: directVid,
-              downloadUrl: dlUrl,
-              thumbnail: thumbUrl,
-              type: "video",
-              quality: "Full HD · 1080p",
-              format: "mp4",
-              width: 1080,
-              height: 1920,
-              aspectRatio: "vertical",
-              hasAudio: true,
-            });
-            break;
-          } else if (directImg && isAuthenticStoryMedia(directImg)) {
-            const streamUrl = buildStreamUrl(directImg, "story-1.jpg", true);
-            const dlUrl = buildStreamUrl(directImg, `${safeFilename(title, "jpg")}-story-1.jpg`, false);
-            stories.push({
-              storyNumber: 1,
-              mediaIndex: 0,
-              type: "photo",
-              duration: null,
-              thumbnail: streamUrl,
-              createdAt: new Date().toISOString().split("T")[0],
-              url: streamUrl,
-              downloadUrl: dlUrl,
-            });
-            media.push({
-              url: streamUrl,
-              rawUrl: directImg,
-              downloadUrl: dlUrl,
-              thumbnail: streamUrl,
-              type: "image",
-              quality: "Original HD",
-              format: "jpg",
-              width: 1080,
-              height: 1920,
-              aspectRatio: "vertical",
-              hasAudio: false,
-            });
-            break;
-          }
-        } catch {
-          // continue to next candidate
-        }
-      }
-    }
-
-    // Engine 4: Public oEmbed API for Story title & author
-    if (!creator.handle && targetUrl) {
-      try {
-        const oembedRes = await fetch(
-          `https://api.instagram.com/oembed/?url=${encodeURIComponent(targetUrl)}`,
-          { headers: { "User-Agent": DESKTOP_UA }, signal: AbortSignal.timeout(5000) }
-        );
-        if (oembedRes.ok) {
-          const oembed = await oembedRes.json();
-          if (oembed.author_name) {
-            creator.handle = oembed.author_name;
-            creator.name = oembed.author_name;
-            creator.profileUrl = `https://www.instagram.com/${oembed.author_name}/`;
-          }
-          if (oembed.title && (!title || title === "Instagram Story")) {
-            title = oembed.title;
-          }
-          if (oembed.thumbnail_url && !cover && isAuthenticStoryMedia(oembed.thumbnail_url)) {
-            cover = buildStreamUrl(oembed.thumbnail_url, "cover.jpg", true);
-          }
-        }
-      } catch {
-        // ignore
-      }
+    const target = parseStoryTarget(resolvedUrl);
+    if (!target) {
+      res.status(400).json({
+        error:
+          "Paste an Instagram Story (/stories/username/…) or Highlight (/stories/highlights/… or /s/…) link.",
+      });
+      return;
     }
 
     const downloadId = uuidv4().replace(/-/g, "");
+    let title = target.kind === "highlight" ? "Instagram Highlight" : `@${target.username}'s Story`;
+    const creator: DownloadCreator = {
+      handle: target.username,
+      name: target.username,
+      avatarUrl: null,
+      profileUrl: target.username ? `https://www.instagram.com/${target.username}/` : null,
+      verified: false,
+    };
 
-    if (stories.length === 0) {
+    const fetched = await fetchInstagramStoryMedia(target, userCookie);
+
+    if (!fetched) {
       const fallbackResponse: HighlightResult = {
         downloadId,
-        title: storyUsername ? `@${storyUsername}'s Story` : "Instagram Story",
+        title,
         cover: null,
         creator,
         stories: [],
         truncated: false,
         requiresDirectLinkAlert: true,
-        alertMessage: "This story or highlight is private, expired, or temporarily unavailable. Make sure the creator's account is public and active.",
+        alertMessage:
+          "This story or highlight is private, expired, or temporarily unavailable. Make sure the creator's account is public and active.",
       };
       res.json(fallbackResponse);
       return;
     }
 
+    if (fetched.title) title = fetched.title;
+    if (fetched.creator) {
+      const c = fetched.creator;
+      creator.handle = c.handle || creator.handle;
+      creator.name = c.name || creator.name || creator.handle;
+      creator.verified = Boolean(c.verified);
+      creator.profileUrl = c.profileUrl || creator.profileUrl;
+      if (c.avatarUrl) {
+        creator.avatarUrl = buildStreamUrl(c.avatarUrl, `${creator.handle || "creator"}-avatar.jpg`, true);
+      }
+    }
+
+    const stories: HighlightStory[] = [];
+    const media: DownloadMedia[] = [];
+    const today = new Date().toISOString().split("T")[0];
+
+    fetched.items
+      .filter((it) => !isPlaceholderAsset(it.url))
+      .forEach((it, idx) => {
+        const n = idx + 1;
+        const isVid = it.type === "video";
+        const ext = isVid ? "mp4" : "jpg";
+        const streamUrl = buildStreamUrl(it.url, `story-${n}.${ext}`, true);
+        const dlUrl = buildStreamUrl(it.url, safeFilename(`${title}-story-${n}`, ext), false);
+        const thumb = it.thumbnail
+          ? buildStreamUrl(it.thumbnail, `story-thumb-${n}.jpg`, true)
+          : isVid
+          ? null
+          : streamUrl;
+
+        stories.push({
+          storyNumber: n,
+          mediaIndex: idx,
+          type: it.type,
+          duration: it.duration ?? (isVid ? 15 : null),
+          thumbnail: thumb,
+          createdAt: it.takenAt || today,
+          url: streamUrl,
+          downloadUrl: dlUrl,
+        });
+        media.push({
+          url: streamUrl,
+          rawUrl: it.url,
+          downloadUrl: dlUrl,
+          thumbnail: thumb,
+          type: isVid ? "video" : "image",
+          quality: isVid ? "Direct CDN video · MP4" : "Direct CDN photo · High-res",
+          format: ext,
+          width: 1080,
+          height: 1920,
+          aspectRatio: "vertical",
+          hasAudio: isVid,
+        });
+      });
+
+    if (stories.length === 0) {
+      res.json({
+        downloadId,
+        title,
+        cover: null,
+        creator,
+        stories: [],
+        truncated: false,
+        requiresDirectLinkAlert: true,
+        alertMessage:
+          "This story or highlight is private, expired, or temporarily unavailable. Make sure the creator's account is public and active.",
+      } satisfies HighlightResult);
+      return;
+    }
+
+    const cover =
+      fetched.cover && !isPlaceholderAsset(fetched.cover)
+        ? buildStreamUrl(fetched.cover, "cover.jpg", true)
+        : stories.find((s) => s.thumbnail)?.thumbnail || null;
+
     resultCache.set(downloadId, {
       createdAt: Date.now(),
-      sourceUrl: targetUrl,
+      sourceUrl: target.canonicalUrl,
       platform: "instagram",
       media,
       avatarUrl: creator.avatarUrl || cover,
@@ -2817,15 +3312,14 @@ app.post("/api/highlight", async (req: Request, res: Response) => {
     const responseData: HighlightResult = {
       downloadId,
       title: title || (creator.handle ? `@${creator.handle}'s Stories` : "Instagram Stories"),
-      cover: cover || stories[0]?.thumbnail || null,
+      cover,
       creator,
       stories,
       truncated: false,
       requiresDirectLinkAlert: false,
+      source: fetched.engine,
     };
-
     res.json(responseData);
-    return;
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Failed to extract highlight";
     res.status(500).json({ error: message });
@@ -2836,7 +3330,17 @@ async function handleDownload(req: Request, res: Response) {
   try {
     pruneCache();
     const payload = req.method === "POST" ? req.body : req.query;
-    const { downloadId, url: directUrl, filename, assetType, mediaIndex, format, items } = payload;
+    const {
+      downloadId,
+      url: directUrl,
+      filename,
+      assetType,
+      mediaIndex,
+      format,
+      items,
+      platform: directPlatform,
+      title: directTitle,
+    } = payload;
 
     const cached = downloadId ? resultCache.get(downloadId) : undefined;
 
@@ -2941,11 +3445,16 @@ async function handleDownload(req: Request, res: Response) {
       return;
     }
 
-    const downloadName = filename || (cached?.title ? safeFilename(cached.title, fallbackExt) : `media.${fallbackExt}`);
+    const platform =
+      cached?.platform ||
+      (directPlatform as Platform) ||
+      (targetUrl ? detectPlatform(targetUrl) : null);
+    const resolvedTitle = cached?.title || directTitle || "omnidownloader-media";
+    const downloadName = filename || safeFilename(resolvedTitle, fallbackExt);
     const cleanBase = downloadName.replace(/[^\w.\- ]+/g, "_");
 
     if (
-      cached?.platform === "youtube" ||
+      platform === "youtube" ||
       targetUrl.includes("youtube.com") ||
       targetUrl.includes("youtu.be")
     ) {
@@ -2966,6 +3475,7 @@ async function handleDownload(req: Request, res: Response) {
         const cleanName = cleanBase.endsWith(".mp3") ? cleanBase : `${cleanBase.replace(/\.[^/.]+$/, "")}.mp3`;
         const tmpAudioPath = `/tmp/omni-audio-${uuidv4()}.mp3`;
 
+        const cookieArgs = getYtDlpCookieArgs();
         try {
           await execFileAsync(
             ytDlpPath,
@@ -2982,11 +3492,13 @@ async function handleDownload(req: Request, res: Response) {
               "--extractor-args",
               "youtube:player_client=android,web",
               "--no-warnings",
+              "--no-progress",
+              ...cookieArgs,
               "-o",
               tmpAudioPath,
               sourceVideoUrl,
             ],
-            { timeout: 120000 }
+            { timeout: 180000, maxBuffer: 50 * 1024 * 1024 }
           );
 
           if (fs.existsSync(tmpAudioPath)) {
@@ -3004,30 +3516,16 @@ async function handleDownload(req: Request, res: Response) {
             });
             return;
           }
-        } catch {
+        } catch (ytAudioErr) {
           try {
             if (fs.existsSync(tmpAudioPath)) fs.unlinkSync(tmpAudioPath);
           } catch {}
-          res.setHeader("Content-Type", "audio/mpeg");
-          res.setHeader("Content-Disposition", `attachment; filename="${cleanName}"`);
-          const ytdlProcess = spawn(ytDlpPath, [
-            "-f",
-            "bestaudio/best",
-            "-x",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "320k",
-            "--ffmpeg-location",
-            "/usr/bin/ffmpeg",
-            "--extractor-args",
-            "youtube:player_client=android,web",
-            "--no-warnings",
-            "-o",
-            "-",
-            sourceVideoUrl,
-          ]);
-          ytdlProcess.stdout.pipe(res);
+          const isBot = String(ytAudioErr).includes("bot") || String(ytAudioErr).includes("Sign in");
+          res.status(502).json({
+            error: isBot
+              ? "YouTube requires verification on this server. Please provide a YOUTUBE_COOKIE in settings, or download from TikTok, Instagram, or Pinterest."
+              : "Could not convert YouTube audio. Please try downloading the video instead.",
+          });
           return;
         }
       }
@@ -3038,11 +3536,13 @@ async function handleDownload(req: Request, res: Response) {
         const targetHeight = mediaItem?.height || 1080;
         const cleanName = cleanBase.endsWith(".mp4") ? cleanBase : `${cleanBase.replace(/\.[^/.]+$/, "")}.mp4`;
         const tmpVideoPath = `/tmp/omni-vid-${uuidv4()}.mp4`;
+        const cookieArgs = getYtDlpCookieArgs();
 
         const formatSpec = targetHeight
-          ? `bestvideo[height<=${targetHeight}]+bestaudio/best[ext=mp4]/best`
-          : `bestvideo+bestaudio/best[ext=mp4]/best`;
+          ? `bestvideo[height<=${targetHeight}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${targetHeight}]+bestaudio/best[height<=${targetHeight}][ext=mp4]/best[ext=mp4]/best`
+          : `bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best`;
 
+        let lastDlErr: any = null;
         try {
           await execFileAsync(
             ytDlpPath,
@@ -3056,11 +3556,13 @@ async function handleDownload(req: Request, res: Response) {
               "--extractor-args",
               "youtube:player_client=android,web",
               "--no-warnings",
+              "--no-progress",
+              ...cookieArgs,
               "-o",
               tmpVideoPath,
               sourceVideoUrl,
             ],
-            { timeout: 180000 }
+            { timeout: 180000, maxBuffer: 50 * 1024 * 1024 }
           );
 
           if (fs.existsSync(tmpVideoPath)) {
@@ -3080,25 +3582,59 @@ async function handleDownload(req: Request, res: Response) {
             });
             return;
           }
-        } catch {
+        } catch (err) {
+          lastDlErr = err;
+          // Robust fallback: download best progressive mp4 format directly
+          try {
+            await execFileAsync(
+              ytDlpPath,
+              [
+                "-f",
+                "18/22/best[ext=mp4]/best",
+                "--ffmpeg-location",
+                "/usr/bin/ffmpeg",
+                "--extractor-args",
+                "youtube:player_client=android,web",
+                "--no-warnings",
+                "--no-progress",
+                ...cookieArgs,
+                "-o",
+                tmpVideoPath,
+                sourceVideoUrl,
+              ],
+              { timeout: 180000, maxBuffer: 50 * 1024 * 1024 }
+            );
+
+            if (fs.existsSync(tmpVideoPath)) {
+              const stat = fs.statSync(tmpVideoPath);
+              res.setHeader("Content-Type", "video/mp4");
+              res.setHeader("Content-Length", stat.size);
+              res.setHeader("Content-Disposition", `attachment; filename="${cleanName}"`);
+              res.setHeader("Accept-Ranges", "bytes");
+
+              const fileStream = fs.createReadStream(tmpVideoPath);
+              fileStream.pipe(res);
+              fileStream.on("close", () => {
+                fs.unlink(tmpVideoPath, () => {});
+              });
+              fileStream.on("error", () => {
+                fs.unlink(tmpVideoPath, () => {});
+              });
+              return;
+            }
+          } catch (fbErr) {
+            lastDlErr = fbErr;
+          }
+
           try {
             if (fs.existsSync(tmpVideoPath)) fs.unlinkSync(tmpVideoPath);
           } catch {}
-          res.setHeader("Content-Type", "video/mp4");
-          res.setHeader("Content-Disposition", `attachment; filename="${cleanName}"`);
-          const ytdlProcess = spawn(ytDlpPath, [
-            "-f",
-            "best[ext=mp4]/best",
-            "--ffmpeg-location",
-            "/usr/bin/ffmpeg",
-            "--extractor-args",
-            "youtube:player_client=android,web",
-            "--no-warnings",
-            "-o",
-            "-",
-            sourceVideoUrl,
-          ]);
-          ytdlProcess.stdout.pipe(res);
+          const isBot = String(lastDlErr).includes("bot") || String(lastDlErr).includes("Sign in");
+          res.status(502).json({
+            error: isBot
+              ? "YouTube requires verification on this server. Please provide a YOUTUBE_COOKIE in settings, or download from TikTok, Instagram, or Pinterest."
+              : "Could not download YouTube video. Please try another quality option.",
+          });
           return;
         }
       }
@@ -3106,12 +3642,68 @@ async function handleDownload(req: Request, res: Response) {
 
     // Pure MP3 audio extraction for non-YouTube video sources
     if (assetType === "audio" || format === "mp3" || downloadName.endsWith(".mp3")) {
-      const cleanAudioName = cleanBase.endsWith(".mp3") ? cleanBase : `${cleanBase.replace(/\.[^/.]+$/, "")}.mp3`;
+      const cleanAudioName = cleanBase.endsWith(".mp3")
+        ? cleanBase
+        : `${cleanBase.replace(/\.[^/.]+$/, "")}.mp3`;
+      const tmpRawPath = `/tmp/omni-raw-${uuidv4()}.mp4`;
       const tmpFfmpegAudio = `/tmp/omni-audio-${uuidv4()}.mp3`;
+
       try {
+        if (
+          (platform === "tiktok" || targetUrl.includes("tiktok.com")) &&
+          !targetUrl.includes(".mp3") &&
+          !targetUrl.includes("tiktokcdn.com")
+        ) {
+          try {
+            const freshData = await callTikWm(cached?.sourceUrl || targetUrl);
+            const freshAudio = absoluteTikWmUrl(freshData?.music || freshData?.play || freshData?.hdplay);
+            if (freshAudio) {
+              targetUrl = freshAudio;
+            }
+          } catch {}
+        }
+
+        const parsedTarget = new URL(targetUrl);
+        const referer = parsedTarget.hostname.includes("tiktok")
+          ? "https://www.tiktok.com/"
+          : parsedTarget.hostname.includes("instagram") || parsedTarget.hostname.includes("fbcdn")
+          ? "https://www.instagram.com/"
+          : parsedTarget.origin;
+
+        let upstreamRes = await fetch(targetUrl, {
+          headers: {
+            "User-Agent": DESKTOP_UA,
+            Referer: referer,
+          },
+          signal: AbortSignal.timeout(30000),
+        });
+
+        if (
+          (upstreamRes.status === 403 || !upstreamRes.ok || upstreamRes.headers.get("content-type")?.includes("text/html")) &&
+          (cached?.sourceUrl || targetUrl.includes("tiktok"))
+        ) {
+          try {
+            const freshData = await callTikWm(cached?.sourceUrl || targetUrl);
+            const freshPlay = absoluteTikWmUrl(freshData?.music || freshData?.play || freshData?.hdplay);
+            if (freshPlay) {
+              upstreamRes = await fetch(freshPlay, {
+                headers: { "User-Agent": DESKTOP_UA, Referer: "https://www.tiktok.com/" },
+                signal: AbortSignal.timeout(30000),
+              });
+            }
+          } catch {}
+        }
+
+        if (!upstreamRes.ok) {
+          throw new Error("Could not download upstream media for audio extraction");
+        }
+
+        const arrayBuf = await upstreamRes.arrayBuffer();
+        fs.writeFileSync(tmpRawPath, Buffer.from(arrayBuf));
+
         await execFileAsync("/usr/bin/ffmpeg", [
           "-i",
-          targetUrl,
+          tmpRawPath,
           "-vn",
           "-acodec",
           "libmp3lame",
@@ -3128,28 +3720,23 @@ async function handleDownload(req: Request, res: Response) {
           res.setHeader("Content-Disposition", `attachment; filename="${cleanAudioName}"`);
           const fileStream = fs.createReadStream(tmpFfmpegAudio);
           fileStream.pipe(res);
-          fileStream.on("close", () => {
-            fs.unlink(tmpFfmpegAudio, () => {});
-          });
-          fileStream.on("error", () => {
-            fs.unlink(tmpFfmpegAudio, () => {});
-          });
+          const cleanup = () => {
+            try {
+              if (fs.existsSync(tmpRawPath)) fs.unlinkSync(tmpRawPath);
+              if (fs.existsSync(tmpFfmpegAudio)) fs.unlinkSync(tmpFfmpegAudio);
+            } catch {}
+          };
+          fileStream.on("close", cleanup);
+          fileStream.on("error", cleanup);
           return;
         }
       } catch {
-        if (cached?.audioUrl && cached.audioUrl !== targetUrl) {
-          const aFetch = await fetch(cached.audioUrl, {
-            headers: { "User-Agent": DESKTOP_UA },
-            signal: AbortSignal.timeout(20000),
-          });
-          if (aFetch.ok) {
-            res.setHeader("Content-Type", "audio/mpeg");
-            res.setHeader("Content-Disposition", `attachment; filename="${cleanAudioName}"`);
-            const buf = await aFetch.arrayBuffer();
-            res.send(Buffer.from(buf));
-            return;
-          }
-        }
+        try {
+          if (fs.existsSync(tmpRawPath)) fs.unlinkSync(tmpRawPath);
+          if (fs.existsSync(tmpFfmpegAudio)) fs.unlinkSync(tmpFfmpegAudio);
+        } catch {}
+        res.status(502).json({ error: "Could not extract MP3 audio from this media. Please try downloading the video instead." });
+        return;
       }
     }
 
@@ -3160,13 +3747,33 @@ async function handleDownload(req: Request, res: Response) {
       ? "https://www.instagram.com/"
       : parsedTarget.origin;
 
-    const mediaFetch = await fetch(targetUrl, {
+    let mediaFetch = await fetch(targetUrl, {
       headers: {
         "User-Agent": DESKTOP_UA,
         Referer: referer,
       },
       signal: AbortSignal.timeout(25000),
     });
+
+    if (
+      mediaFetch.status === 403 &&
+      cached?.sourceUrl &&
+      (targetUrl.includes("tiktokcdn") || targetUrl.includes("tiktok"))
+    ) {
+      try {
+        const freshData = await callTikWm(cached.sourceUrl);
+        const freshPlay = freshData?.play || freshData?.hdplay;
+        if (freshPlay) {
+          mediaFetch = await fetch(freshPlay, {
+            headers: {
+              "User-Agent": DESKTOP_UA,
+              Referer: "https://www.tiktok.com/",
+            },
+            signal: AbortSignal.timeout(25000),
+          });
+        }
+      } catch {}
+    }
 
     if (!mediaFetch.ok) {
       res.status(502).json({ error: "Media source could not be reached or downloaded." });

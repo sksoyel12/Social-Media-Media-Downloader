@@ -513,6 +513,12 @@ button { color: inherit; }
 .story-download { display:flex; align-items:center; justify-content:center; gap:6px; min-width:80px; min-height:38px; padding:0 12px; border:1px solid rgba(255,255,255,.12); border-radius:11px; background:rgba(255,255,255,.06); color:#dce1e4; font-size:11.5px; font-weight:500; cursor:pointer; white-space:nowrap; }
 .story-download:hover:not(:disabled) { background:rgba(255,255,255,.12); }
 .story-download:disabled { opacity:.6; cursor:wait; }
+.story-row { cursor:pointer; }
+.story-row.active { border-color:rgba(169,194,255,.55); background:rgba(169,194,255,.08); }
+.story-thumb video { width:100%; height:100%; object-fit:cover; }
+.story-preview { display:flex; flex-direction:column; align-items:center; gap:10px; margin-bottom:12px; }
+.story-preview > img { max-height:420px; max-width:100%; border-radius:16px; object-fit:contain; background:rgba(0,0,0,.28); }
+.story-preview-save { width:100%; }
 .highlight-download-all { margin-top:14px; }
 
 .disclaimer { display:flex; align-items:center; justify-content:center; gap:8px; max-width:900px; margin:20px auto 0; color:#858a92; font-size:11px; line-height:1.5; text-align:center; }

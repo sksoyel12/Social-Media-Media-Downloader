@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
   Archive,
@@ -10,6 +11,12 @@ import {
   Video,
 } from 'lucide-react';
 import type { DownloadResult, HighlightResult, HighlightStory } from '../types/api';
+import { CupertinoPlayer } from './CupertinoPlayer';
+
+/** Never mount placeholder graphics (Instagram logo / brand assets) as story media. */
+const PLACEHOLDER_RE = /instagram[_-]?logo|brand[_-]?assets|favicon|apple-touch-icon|\/rsrc\.php\/|\/static\/images\//i;
+const isRealStory = (story: HighlightStory): boolean =>
+  Boolean(story.url) && !PLACEHOLDER_RE.test(decodeURIComponent(story.url!));
 
 export interface HighlightPackageProps {
   highlight: HighlightResult;
@@ -32,10 +39,20 @@ export function HighlightPackage({
   onDownloadAllStories,
   onDownloadAvatar,
 }: HighlightPackageProps) {
-  if (highlight.requiresDirectLinkAlert || highlight.stories.length === 0) {
+  // Mount the story cards as soon as real media exists; the notice is only for truly empty results.
+  const stories = useMemo(() => highlight.stories.filter(isRealStory), [highlight.stories]);
+  const [activeNumber, setActiveNumber] = useState<number | null>(null);
+
+  useEffect(() => {
+    setActiveNumber(stories[0]?.storyNumber ?? null);
+  }, [highlight.downloadId, stories]);
+
+  const activeStory = stories.find((s) => s.storyNumber === activeNumber) ?? stories[0];
+
+  if (stories.length === 0) {
     return (
       <motion.div
-        className="ios-alert-card"
+        className="ios-alert-card max-w-xl mx-auto"
         role="alert"
         data-testid="alert-highlight-direct-link"
         initial={{ opacity: 0, y: 12, scale: 0.97 }}
@@ -47,15 +64,19 @@ export function HighlightPackage({
           <Sparkles size={22} />
         </div>
         <h2 className="text-base font-semibold text-white tracking-tight">
-          Story / Highlight Notice
+          Instagram Story &amp; Highlight Notice
         </h2>
         <p className="mt-2 text-sm text-[#c5cad3] leading-relaxed">
           {highlight.alertMessage ||
-            'This story or highlight is private, expired, or temporarily unavailable.'}
+            'This story or highlight is private, expired (24h past), or currently unavailable.'}
         </p>
-        <p className="mt-2 text-xs text-[#8e949f]">
-          Verify that the user profile is public and active. For 24-hour stories, ensure the post has not expired.
-        </p>
+
+        <div className="mt-4 text-xs text-[#9aa0ac] space-y-2 text-left bg-white/5 p-3.5 rounded-xl border border-white/10">
+          <p className="font-semibold text-white/90">Tips for Instagram downloads:</p>
+          <p>&bull; <strong>Stories (24h)</strong>: Must be actively posted within the last 24 hours on a public profile.</p>
+          <p>&bull; <strong>Reels &amp; Posts</strong>: Any public Reel, Video, or Carousel can be downloaded instantly by pasting its URL above.</p>
+          <p>&bull; <strong>HD Profile Photos</strong>: Paste any @username to preview and download full-resolution profile photos.</p>
+        </div>
       </motion.div>
     );
   }
@@ -95,8 +116,7 @@ export function HighlightPackage({
               {highlight.creator.name || highlight.creator.handle || 'Public Instagram story'}
             </div>
             <div className="highlight-story-count">
-              {highlight.stories.length} {highlight.stories.length === 1 ? 'story' : 'stories'}{' '}
-              available
+              {stories.length} {stories.length === 1 ? 'story' : 'stories'} available
             </div>
           </div>
           {highlight.creator.avatarUrl && (
@@ -119,6 +139,35 @@ export function HighlightPackage({
           )}
         </div>
 
+        {activeStory && (
+          <div className="story-preview" data-testid="story-preview">
+            {activeStory.type === 'video' ? (
+              <CupertinoPlayer
+                src={activeStory.url!}
+                poster={activeStory.thumbnail}
+                title={`${highlight.title} · story ${activeStory.storyNumber}`}
+                initialAspectRatio="vertical"
+              />
+            ) : (
+              <img
+                src={activeStory.url}
+                alt={`Story ${activeStory.storyNumber} preview`}
+                referrerPolicy="no-referrer"
+              />
+            )}
+            <button
+              className="story-download story-preview-save"
+              type="button"
+              onClick={() => onDownloadStory(activeStory)}
+              disabled={downloadState[`story-${activeStory.storyNumber}`] === 'loading'}
+              data-testid="button-save-active-story"
+            >
+              Download story #{activeStory.storyNumber}{' '}
+              <ArrowDownToLine size={13} />
+            </button>
+          </div>
+        )}
+
         <button
           className="download-button"
           type="button"
@@ -136,7 +185,7 @@ export function HighlightPackage({
             </>
           ) : (
             <>
-              <Archive size={15} /> Download All ({highlight.stories.length} Stories ZIP)
+              <Archive size={15} /> Download All ({stories.length} {stories.length === 1 ? 'Story' : 'Stories'} ZIP)
             </>
           )}
         </button>
@@ -149,17 +198,25 @@ export function HighlightPackage({
         )}
 
         <div className="stories-list">
-          {highlight.stories.map((story) => {
+          {stories.map((story) => {
             const key = `story-${story.storyNumber}`;
             return (
               <div
-                className="story-row"
+                className={`story-row${story.storyNumber === activeStory?.storyNumber ? ' active' : ''}`}
                 key={story.storyNumber}
                 data-testid={`row-story-${story.storyNumber}`}
+                onClick={() => setActiveNumber(story.storyNumber)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') setActiveNumber(story.storyNumber);
+                }}
               >
                 <div className="story-thumb">
                   {story.thumbnail ? (
                     <img src={story.thumbnail} alt="" referrerPolicy="no-referrer" />
+                  ) : story.type === 'video' && story.url ? (
+                    <video src={story.url} preload="metadata" muted playsInline />
                   ) : story.type === 'video' ? (
                     <Video size={17} />
                   ) : (
@@ -180,7 +237,10 @@ export function HighlightPackage({
                 <button
                   className="story-download"
                   type="button"
-                  onClick={() => onDownloadStory(story)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDownloadStory(story);
+                  }}
                   disabled={downloadState[key] === 'loading'}
                   data-testid={`button-save-story-${story.storyNumber}`}
                 >

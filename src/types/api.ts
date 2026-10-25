@@ -29,6 +29,8 @@ export interface DownloadResult {
   status: 'success';
   platform: Platform;
   type: 'video' | 'image' | 'carousel' | 'profile';
+  /** TikTok: 'video' (watermark-free MP4) or 'slideshow' (photo slides). */
+  mediaType?: 'video' | 'slideshow';
   title: string;
   caption: string;
   description: string;
@@ -62,6 +64,8 @@ export interface HighlightResult {
   truncated: boolean;
   requiresDirectLinkAlert?: boolean;
   alertMessage?: string;
+  /** Which pipeline stage produced the media (graphql, reels_media, embed, mirror:<name>). */
+  source?: string;
 }
 
 export interface HealthStatus {
@@ -87,4 +91,6 @@ export interface DownloadFileInput {
   format: 'original' | 'webp' | 'mp3';
   bitrate: 128 | 320;
   items?: Array<{ url: string; type: string; filename?: string }>;
+  platform?: Platform;
+  title?: string;
 }

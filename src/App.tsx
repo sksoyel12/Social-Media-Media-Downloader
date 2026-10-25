@@ -72,30 +72,27 @@ function saveBlob(blob: Blob, name: string) {
   const anchor = document.createElement('a');
   anchor.href = objectUrl;
   anchor.download = name;
-  anchor.style.display = 'none';
+  anchor.rel = 'noopener noreferrer';
+  anchor.style.position = 'fixed';
+  anchor.style.left = '-9999px';
   document.body.appendChild(anchor);
   anchor.click();
-  anchor.remove();
-  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1500);
+  setTimeout(() => {
+    anchor.remove();
+    URL.revokeObjectURL(objectUrl);
+  }, 3000);
 }
 
 async function triggerDirectBrowserDownload(downloadUrl: string, filename: string): Promise<void> {
-  try {
-    const response = await fetch(downloadUrl);
-    if (!response.ok) {
-      throw new Error('Could not fetch media stream');
-    }
-    const blob = await response.blob();
-    saveBlob(blob, filename);
-  } catch {
-    const anchor = document.createElement('a');
-    anchor.href = downloadUrl;
-    anchor.download = filename;
-    anchor.style.display = 'none';
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-  }
+  const anchor = document.createElement('a');
+  anchor.href = downloadUrl;
+  anchor.download = filename;
+  anchor.rel = 'noopener noreferrer';
+  anchor.style.position = 'fixed';
+  anchor.style.left = '-9999px';
+  document.body.appendChild(anchor);
+  anchor.click();
+  setTimeout(() => anchor.remove(), 1000);
 }
 
 function resultTypeLabel(result: DownloadResult) {
@@ -332,9 +329,7 @@ function Downloader() {
 
   const handleQualityChange = (val: string) => {
     setSelectedQualityKey(val);
-    if (val === 'audio-mp3') {
-      // Audio MP3 selected
-    } else if (val === 'image-original') {
+    if (val === 'image-original') {
       setImageFormat('original');
     } else if (val === 'image-webp') {
       setImageFormat('webp');
@@ -347,11 +342,7 @@ function Downloader() {
   };
 
   const handleMainDownload = () => {
-    if (selectedQualityKey === 'audio-mp3') {
-      downloadAudio();
-    } else {
-      downloadMedia(activeIndex);
-    }
+    downloadMedia(activeIndex);
   };
 
   const setLocalStatus = (key: string, status: 'loading' | 'done' | 'error', message = '') => {
@@ -540,30 +531,35 @@ function Downloader() {
     const key = `audio-${audioBitrate}`;
     setLocalStatus(key, 'loading');
     const filename = `${safeName(result.title)}-${audioBitrate}kbps.mp3`;
+    const audioSourceUrl = result.audioUrl || activeMedia?.rawUrl || activeMedia?.url || '';
+    const audioUrlParam = encodeURIComponent(audioSourceUrl);
+    const directAudioUrl = `/api/download?downloadId=${result.downloadId}&format=mp3&assetType=audio&url=${audioUrlParam}&title=${encodeURIComponent(result.title)}&platform=${result.platform}`;
 
     try {
-      const isPureMp3 = Boolean(result.audioUrl && (result.audioUrl.toLowerCase().includes('.mp3') || result.audioUrl.includes('mime=audio')));
-      if (isPureMp3 && result.audioUrl && result.platform !== 'youtube') {
-        await triggerDirectBrowserDownload(result.audioUrl, filename);
-        setLocalStatus(key, 'done');
-        return;
-      }
-
       const blob = await fileMutation.mutateAsync({
         data: {
           downloadId: result.downloadId,
-          url: activeMedia?.rawUrl || activeMedia?.url,
+          url: audioSourceUrl,
           filename,
           assetType: 'audio',
           mediaIndex: null,
           format: 'mp3',
           bitrate: audioBitrate,
+          platform: result.platform,
+          title: result.title,
         },
       });
-      saveBlob(blob, filename);
+      // Explicitly wrap the Blob in audio/mpeg to guarantee browsers treat it as pure MP3 audio
+      const audioBlob = new Blob([blob], { type: 'audio/mpeg' });
+      saveBlob(audioBlob, filename);
       setLocalStatus(key, 'done');
     } catch (error) {
-      setLocalStatus(key, 'error', errorText(error));
+      try {
+        await triggerDirectBrowserDownload(directAudioUrl, filename);
+        setLocalStatus(key, 'done');
+      } catch {
+        setLocalStatus(key, 'error', errorText(error));
+      }
     }
   };
 
@@ -941,11 +937,12 @@ function Downloader() {
                 copied={copied}
               />
 
-              {/* 4. Streamlined Controls: Single clean "Quality" dropdown & ONE main high-contrast iOS action button */}
-              <div className="ios-controls-bar pt-1">
+              {/* 4. Streamlined Controls: Dedicated Video and Audio Download Actions */}
+              <div className="ios-controls-bar pt-1 space-y-3">
+                {/* Format / Resolution Dropdown (Videos & Images) */}
                 <div className="ios-quality-dropdown">
                   <label className="block text-[11px] font-medium text-[#989da5] mb-1.5 px-1">
-                    Quality &amp; Format
+                    {isImage ? 'Image Format' : 'Video Resolution'}
                   </label>
                   <div className="relative">
                     <select
@@ -969,11 +966,6 @@ function Downloader() {
                           <option value="image-webp">WebP Optimized</option>
                         </>
                       )}
-
-                      {/* Audio MP3 (320kbps) */}
-                      {audioAvailable && (
-                        <option value="audio-mp3">Audio · MP3 (320 kbps)</option>
-                      )}
                     </select>
                     <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-3 text-white/70">
                       <ChevronDown size={16} />
@@ -981,33 +973,21 @@ function Downloader() {
                   </div>
                 </div>
 
-                {/* ONE main high-contrast iOS action button: "Download Media" */}
+                {/* Primary Action Button: Download Video or Image */}
                 <button
                   type="button"
                   onClick={handleMainDownload}
-                  disabled={
-                    (selectedQualityKey === 'audio-mp3'
-                      ? downloadState[audioDownloadKey]
-                      : downloadState[activeDownloadKey]) === 'loading'
-                  }
+                  disabled={downloadState[activeDownloadKey] === 'loading'}
                   className="ios-primary-btn"
                   data-testid="button-save-media"
                 >
-                  {(selectedQualityKey === 'audio-mp3'
-                    ? downloadState[audioDownloadKey]
-                    : downloadState[activeDownloadKey]) === 'loading' ? (
+                  {downloadState[activeDownloadKey] === 'loading' ? (
                     <>
                       <span className="loader" /> Preparing Download…
                     </>
-                  ) : (selectedQualityKey === 'audio-mp3'
-                    ? downloadState[audioDownloadKey]
-                    : downloadState[activeDownloadKey]) === 'done' ? (
+                  ) : downloadState[activeDownloadKey] === 'done' ? (
                     <>
                       <Check size={16} /> Saved to Downloads
-                    </>
-                  ) : selectedQualityKey === 'audio-mp3' ? (
-                    <>
-                      <Music2 size={16} /> Download Audio (MP3 320kbps)
                     </>
                   ) : isProfileResult ? (
                     <>
@@ -1020,33 +1000,87 @@ function Downloader() {
                     </>
                   ) : (
                     <>
-                      <ArrowDownToLine size={16} /> Download Media (
-                      {isImage
-                        ? imageFormat === 'webp'
-                          ? 'WebP'
-                          : 'HD Image'
-                        : activeMedia
-                        ? qualityLabel(activeMedia)
-                        : 'HD Media'}
-                      )
+                      <ArrowDownToLine size={16} /> Download {isImage ? (imageFormat === 'webp' ? 'WebP Image' : 'HD Image') : 'Video (MP4)'}
                     </>
                   )}
                 </button>
 
-                {/* Inline error notice if download failed */}
-                {(selectedQualityKey === 'audio-mp3'
-                  ? downloadErrors[audioDownloadKey]
-                  : downloadErrors[activeDownloadKey]) && (
+                {/* Direct Video Download link */}
+                <div className="flex justify-center">
+                  <a
+                    href={
+                      activeMedia?.downloadUrl
+                        ? activeMedia.downloadUrl
+                        : `/api/download?downloadId=${result.downloadId}&format=mp4&assetType=media&mediaIndex=${activeIndex}`
+                    }
+                    download={
+                      activeMedia
+                        ? `${safeName(result.title)}.${activeMedia.format || 'mp4'}`
+                        : 'media.mp4'
+                    }
+                    className="text-xs text-[#a9c2ff]/80 hover:text-[#a9c2ff] underline transition-colors"
+                  >
+                    Direct Video Download Link (1-tap save)
+                  </a>
+                </div>
+
+                {/* Inline error notice if video download failed */}
+                {downloadErrors[activeDownloadKey] && (
                   <div
                     className="download-error text-xs flex items-center gap-2 p-2.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-300"
                     role="alert"
                   >
                     <CircleAlert size={14} className="shrink-0" />
-                    <span>
-                      {selectedQualityKey === 'audio-mp3'
-                        ? downloadErrors[audioDownloadKey]
-                        : downloadErrors[activeDownloadKey]}
-                    </span>
+                    <span>{downloadErrors[activeDownloadKey]}</span>
+                  </div>
+                )}
+
+                {/* DEDICATED SEPARATE AUDIO (MP3 320kbps) DOWNLOAD SECTION */}
+                {audioAvailable && (
+                  <div className="pt-3 border-t border-white/10 mt-2">
+                    <button
+                      type="button"
+                      onClick={downloadAudio}
+                      disabled={downloadState[audioDownloadKey] === 'loading'}
+                      className="w-full h-12 rounded-xl font-semibold text-sm transition-all flex items-center justify-center gap-2 cursor-pointer bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-500 hover:from-emerald-500 hover:to-teal-400 text-white shadow-lg shadow-emerald-500/20 active:scale-[0.98] disabled:opacity-50"
+                      data-testid="button-save-audio"
+                    >
+                      {downloadState[audioDownloadKey] === 'loading' ? (
+                        <>
+                          <span className="loader" /> Converting &amp; Downloading MP3…
+                        </>
+                      ) : downloadState[audioDownloadKey] === 'done' ? (
+                        <>
+                          <Check size={16} /> MP3 Saved to Downloads
+                        </>
+                      ) : (
+                        <>
+                          <Music2 size={16} /> Download Audio (MP3 320 kbps)
+                        </>
+                      )}
+                    </button>
+                    <div className="flex justify-center mt-2">
+                      <a
+                        href={`/api/download?downloadId=${result.downloadId}&format=mp3&assetType=audio&url=${encodeURIComponent(
+                          result.audioUrl || activeMedia?.rawUrl || activeMedia?.url || ''
+                        )}&title=${encodeURIComponent(result.title)}&platform=${result.platform}`}
+                        download={`${safeName(result.title)}.mp3`}
+                        className="text-xs text-emerald-400/90 hover:text-emerald-300 underline transition-colors"
+                      >
+                        Direct MP3 Audio Link (Click to save .mp3 file)
+                      </a>
+                    </div>
+
+                    {/* Inline error notice if audio download failed */}
+                    {downloadErrors[audioDownloadKey] && (
+                      <div
+                        className="download-error text-xs flex items-center gap-2 p-2.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-300 mt-2"
+                        role="alert"
+                      >
+                        <CircleAlert size={14} className="shrink-0" />
+                        <span>{downloadErrors[audioDownloadKey]}</span>
+                      </div>
+                    )}
                   </div>
                 )}
 
